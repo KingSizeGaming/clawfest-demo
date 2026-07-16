@@ -1,0 +1,111 @@
+<html lang="en" id="page">
+    <head>
+        <!--Copyrighted material of Incisor® Inc. 2026-->
+        <title>Clawfest</title>
+        <meta charset="utf-8">
+        <meta http-equiv="cache-control" content="no-cache" />
+        <meta http-equiv="expires" content="0" />
+        <meta http-equiv="pragma" content="no-cache" />
+        <meta name="mobile-web-app-capable" content="yes">
+        <meta name="viewport" content="width=device-width,height=device-height,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+        <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+        <meta name="apple-mobile-web-app-title" content="Project Name™"/>
+        <link rel="apple-touch-icon" href="Icon.png"/>
+        <link rel="icon" href="data:,">
+        <style>
+            body 
+            {
+                height: inherit;
+                width: inherit;
+                margin: 0px;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                background-color: #000000;
+                overflow: hidden;
+                user-select: none;
+                -webkit-user-select: none;
+            }
+        </style>
+    </head>
+<body>
+<script type="text/javascript">
+"use strict";
+if(typeof(incr_Config_Clawfest)==="object"){incr_Config_Clawfest.habitatLoaded="habitatIsDead";}function incr_Config_Clawfest(){this.incr_VsA={kcB:this};class SZA{constructor(EbB){this.EbB=EbB;this.TgB=this.EbB.projectName;};oN(oN,wl,eXB){;;console.log("• "+this.TgB+": "+oN);;}};
+;var sjB=new SZA(this);this.incr_VsA.sjB=sjB;;this.assetConfiguration = {"assetPackageScale":"100","soundQuality":"stereo_115","language":"en"};;;
+this.isProjectPublished=true;;;;;;;;;
+this.incisorVersion = '2026.03.09.10.46.24';
+this.incisorVersionSet = 'Red';
+this.projectName = 'Clawfest';
+this.publicProjectName = 'Clawfest';
+this.publishTimestamp="2026.07.17.03.39.04";
+this.habitatTimestamp="2026.07.17.03.39.05.0033";this.coreCanvasResolutionX=720;
+this.coreCanvasResolutionY=1280;
+this.canvasTransparency=false;
+this.mainCameraType="orthographic";
+this.maskingMode="overlapping";
+this.preserveDrawingBuffer=true;
+this.defaultGraphicAssetEffectNodes=["ColorMultiply"];
+this.loadingTierDefinitions=[
+	{
+		"loadingTier":100,
+		"isAutoLoaded":true,
+		"incrementalContentProcessing":false,
+		"assetDataFileSizeLimitKB":800,
+		"performDuplicateRemoval":true
+	}
+];this.fontDefinitions={"SampleFont":{"characterPrefix":"SampleFont_Char","kerningAdjustment":0,"lineHeight":82,"characterWidth":16}};;let Uu={};let ivA;for(let i=this.loadingTierDefinitions.length-1;i>-1;i--){ivA=this.loadingTierDefinitions[i].loadingTier;Uu[ivA]=this.loadingTierDefinitions[i];Uu[ivA].isLoaded=false;Uu[ivA].isLoading=false;}this.loadingTierDefinitions=Uu;;this.canvasParent=document.body;
+this.urlParams={};this.incr_VsA.SM=function(){this.uJA=window.location.href;let UfA=this.uJA.split("?");if(UfA.length>1){let mKB=decodeURIComponent(UfA[1]).split("&");for(let j=0;j<mKB.length;j++){let nm=mKB[j].split("=");this.kcB.urlParams[nm[0]]=nm[1];}}};this.incr_VsA.SM();this.incr_VsA.qcA="W2sWR1zVd6Otl8CkKx37Esr4ZTK2";this.refreshWithUpdatedParams=function(){let iVB=window.location.href.split("?")[0];let YbA="";let HtA=[];for(let ayA in this.urlParams){HtA.push(ayA);}if(HtA.length>0){YbA="?";}for(let i=0;i<HtA.length;i++){YbA+=HtA[i]+"="+this.urlParams[HtA[i]];if(i<HtA.length-1){
+YbA+="&";}}window.location.href=iVB+YbA;};// The 'preloadConfiguration' function below will be called before the target software is loaded and 
+// can be used to customize asset loading. For example, you can custimize the code in this function
+// to perform device detection, and use that information to update the
+// 'projectConfiguration.assetConfiguration.assetPackageScale' value, which would result in a 
+// change to which set of assets are loaded in the target software. Without customization, the 
+// value of each asset configuration will be set to the values listed in the 0th element of the 
+// 'supportedAssetConfigurations' of the current configuration defined in the ProjectSettings.
+//
+// The loading of the main Incisor resources (such as the main "..._habitat.js" file and the 
+// "assetData...js" files) can be customized by manipulating the 'resourceLoadingOverride' function below.
+// 
+// The 'canvasPositionOverride' function below can also be changed to customize the positioning of the 
+// canvas within the page. If defined, it will be called whenever the browser window is resized.
+// 
+// For reference, the code below will be executed within, and called by the main projectConfiguration object.
+
+
+
+
+/** This function is called before the target software is loaded.
+ * Customize this function to configure the project at the beginning of runtime.
+ * @param {ProjectConfiguration} projectConfiguration 
+ */
+function preloadConfiguration(projectConfiguration)
+{
+    ;
+        // Preserving the drawing buffer enables several useful development features, 
+        // but may cause performance issues in published software on some devices.
+        projectConfiguration.preserveDrawingBuffer = false;
+    ;
+    projectConfiguration.canvasParent = document.body;
+// define resource loading override function (this is optional)
+    this.resourceLoadingOverride=function(filename)
+    {
+        if(filename.endsWith("_assetList.js")===true || filename.endsWith("_assetData.js")===true){filename = projectConfiguration.projectName+String.fromCharCode(95)+projectConfiguration.publishTimestamp+"_loadedAssets/" + filename;}
+        var s=document.createElement('script'); 
+        s.setAttribute('src',filename); 
+        document.body.appendChild(s);
+    };
+// define canvas positioning function (this is optional)
+    this.canvasPositionOverride=function(canvas,left,top,width,height)
+    {
+        canvas.style.width = width+'px';
+        canvas.style.height = height+'px';
+        canvas.style.left = left+'px';
+        canvas.style.top = top+'px';
+    };
+};
+;if(typeof(preloadConfiguration)==="function"){this.preloadConfiguration=preloadConfiguration;this.preloadConfiguration(this);}this.incr_VsA.masterAssetListLoaded=false;this.incr_VsA.habitatLoaded=false;this.incr_VsA.vZA=false;this.loadHabitatAndAssetList=async function(){let XgA="Clawfest_"+this.publishTimestamp+"_incisor.js";let jyB="";let iJB=[];
+for(let OD in this.assetConfiguration){iJB.push({reA:OD,SrB:this.assetConfiguration[OD]});}iJB.sort(function(a,b){if(a.reA<b.reA){return(-1);}else{return(1);}});for(let i=0;i<iJB.length;i++){jyB+=String.fromCharCode(65+i)+"-"+iJB[i].SrB;if(i<(iJB.length-1)){jyB+=String.fromCharCode(95);}}let ljB=jyB+"_assetList.js";if(incr_config_Clawfest.resourceLoadingOverride===undefined){var s=document.createElement('script');s.setAttribute('src',XgA);document.body.appendChild(s);}else{incr_config_Clawfest.resourceLoadingOverride(XgA);}let tMB=false;;;if(tMB===false){if(incr_config_Clawfest.resourceLoadingOverride===undefined){var s=document.createElement('script');s.setAttribute('src',incr_config_Clawfest.projectName+String.fromCharCode(95)+incr_config_Clawfest.publishTimestamp+"_loadedAssets/"+ljB);document.body.appendChild(s);}else{incr_config_Clawfest.resourceLoadingOverride(ljB);}};};this.habitatLoadedCallback=function(){
+this.incr_VsA.habitatLoaded=true;if(this.incr_VsA.masterAssetListLoaded===true){incr_habitat_Clawfest.init();}};this.masterAssetListLoadedCallback=function(){this.incr_VsA.masterAssetListLoaded=true;if(this.incr_VsA.habitatLoaded===true){incr_habitat_Clawfest.init();}};}var incr_config_Clawfest=new incr_Config_Clawfest();incr_config_Clawfest.loadHabitatAndAssetList();document.currentScript.parentNode.removeChild(document.currentScript);
+
+</script>

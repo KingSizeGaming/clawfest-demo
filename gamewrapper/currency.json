@@ -1,0 +1,17 @@
+﻿{
+  "GBP": {
+    "locale": "en-GB",
+    "symbol": "£",
+    "code": "GBP"
+  },
+  "USD": {
+    "locale": "en-US",
+    "symbol": "$",
+    "code": "USD"
+  },
+  "EUR": {
+    "locale": "en-IE",
+    "symbol": "€",
+    "code": "EUR"
+  }
+}

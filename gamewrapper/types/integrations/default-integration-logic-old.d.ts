@@ -1,0 +1,37 @@
+import { IntegrationLogic } from './integration-logic';
+import { GameWrapperConfig } from '../GameWrapper';
+import { AnyObject, Currency } from '../UtilTypes';
+import { RgsAdapter } from '../rgs/RgsAdapter';
+import { Rgs } from '../rgs/Rgs';
+import { RgsError, RgsBonusOffer, StakeLimits } from '../rgs/RgsTypes';
+import Autoplay from '../autoplay/Autoplay';
+declare type BonusOfferFinishReason = 'offerSpent' | 'offerUnavailable';
+export declare class DefaultIntegrationLogic extends IntegrationLogic {
+    protected config: GameWrapperConfig;
+    protected unsettledTicketExists: boolean;
+    protected isUsingBonusFunds: boolean;
+    protected remainingBonusRounds: number;
+    protected activeOffer: RgsBonusOffer;
+    protected bonusRoundsRgs: Rgs;
+    init(config: GameWrapperConfig): void;
+    setUnsettledTicketExists(ticketExists: boolean): void;
+    applyCurrencyLocaleOverride(currencyCode?: string): Currency;
+    formatCurrency(value: number, trimFraction?: boolean, currencyCode?: string): string;
+    formatNumber(value: number, trimFraction?: boolean): string;
+    updateLoadingProgress(progress: number): void;
+    muteSound(mute: boolean): void;
+    showInfoMessage(scenario: string, message?: string): Promise<void>;
+    handleRgsError(reason: RgsError): void;
+    handleReplayStarted(): Promise<void>;
+    handleReplayFinished(): void;
+    protected registerPlugins(): void;
+    protected handleContextBalanceUpdate(rgs: RgsAdapter<Rgs>, data: AnyObject): Promise<void>;
+    protected handleErrorInAutoplay(autoplay: Autoplay, data: AnyObject): Promise<void>;
+    protected initBonusOffersSupport(): Promise<any>;
+    protected handleBonusOffer(offer: RgsBonusOffer): void;
+    protected finishBonusOffer(reason: BonusOfferFinishReason): void;
+    protected isBetAvailable(rgs: RgsAdapter<Rgs>, bet: number | number[]): boolean;
+    protected getLimitsForBet(rgs: RgsAdapter<Rgs>, bet: number): StakeLimits;
+    protected setEventHandlers(): void;
+}
+export {};
