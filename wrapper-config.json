@@ -1,0 +1,49 @@
+{
+  "gameId": "clawfest-6",
+  "defaultStake": 6,
+  "stakes": [6],
+  "gameConfig": {
+    "gameId": "clawfest-6",
+    "gameType": "fixed-odds",
+    "gameEngine": "fixed-odds",
+    "ticketPrice": [6],
+    "defaultStake": 6
+  },
+  "ui": {
+    "topBar": false,
+    "bonusToggleButton": false,
+    "splash": {
+      "logo": true,
+      "progressBar": true
+    },
+    "bottomBar": {
+      "btnMenu": false,
+      "btnLobby": true,
+      "btnHelp": false,
+      "btnSound": true,
+      "btnAutoplay": false,
+      "lblBalance": true,
+      "lblBet": true,
+      "lblWinAmount": true,
+      "lblGameMode": true
+    }
+  },
+  "postMessage": {
+    "allowedEvents": [
+      "betStops",
+      "volume",
+      "updatePlayer",
+      "gameReady",
+      "gameStart",
+      "gameEnd",
+      "bonusStart",
+      "bonusEnd",
+      "outOfCoins",
+      "error"
+    ],
+    "boolean": {
+      "true": "true",
+      "false": "false"
+    }
+  }
+}

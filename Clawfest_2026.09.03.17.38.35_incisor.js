@@ -2569,23 +2569,28 @@ class AudioController {
         if (!source) return;
 
         const soundNames = [
-            "1_bgm_idle", 
-            "2_bgm_play", 
-            "3_pop_up_appearance", 
+            "1_bgm_idle",
+            "2_bgm_play",
+            "3_pop_up_appearance",
             "4_pop_up_disappearance",
-            "5_main_button", 
-            "6_prizemap_anim", 
-            "7_enter_gameplay", 
+            "5_main_button",
+            "6_prizemap_anim",
+            "7_enter_gameplay",
             "8_counter",
-            "9_button_gameplay", 
-            "10_claw_horizontal", 
-            "11_claw_stop", 
+            "9_button_gameplay",
+            "10_claw_horizontal",
+            "11_claw_stop",
             "12_prize_highlight",
-            "13_claw_vertical", 
-            "14_claw_closes", 
-            "15_anticipation", 
-            "16_get_prize", 
-            "17_youwon_banner"
+            "13_claw_vertical",
+            "14_claw_closes",
+            "15_anticipation",
+            "16_get_prize",
+            "17_youwon_banner",
+            "18_button_reveal",
+            "19_mystery_reveal",
+            "20_mystery_anticipation",
+            "21_mystery_drop",
+            "22_mystery_winbanner"
         ];
 
         soundNames.forEach(name => {
@@ -2879,6 +2884,7 @@ class GameIntro extends FlowState {
 
         // The backdrop flash belongs to the first entry only -- GameIdle re-arms
         // this same button for every later round.
+        this.hasPlayedIntroAnimation = false;
         if (!this.hasPlayedIntroAnimation) {
             await this.runAnimationSequence();
             this.hasPlayedIntroAnimation = true;
@@ -2888,8 +2894,24 @@ class GameIntro extends FlowState {
         this.userPressedPlay = true;
 
         // There is no stake to choose: Start buys the ticket and the round
-        // begins with its fixed allocation of picks.
-        pr.setBetController.startRound();
+        // begins with its fixed allocation of picks -- unless a mid-round
+        // ticket survived a disconnect (staged onto pendingResume during
+        // bootstrap, see ProjectMain.js STEP 7), in which case resume it
+        // instead of buying a new one.
+        if (pr.setBetController?.pendingResume) {
+            const { ticket, progress } = pr.setBetController.pendingResume;
+            pr.setBetController.pendingResume = null;
+            const resumed = await pr.setBetController.resumeRoundFromTicket(ticket, progress);
+            if (!resumed) {
+                // Saved progress couldn't be trusted -- settle the stale
+                // ticket and fall back to a normal fresh round rather than
+                // stranding the player on an unresumable one.
+                await pr.wrapperManager._doSettleTicket().catch(() => {});
+                pr.setBetController.startRound();
+            }
+        } else {
+            pr.setBetController.startRound();
+        }
     }
 
     async runAnimationSequence() {
@@ -2903,6 +2925,7 @@ class GameIntro extends FlowState {
                 this.bgPanel.materialMaster.fillColor.swoop.alpha(1, duration);
                 await this.wait(duration * 1000);
             }
+            this.bgPanel.disable();
         }
     }
 
@@ -2917,7 +2940,7 @@ class GameIdle extends FlowState {
 
     async startIdle() {
         await new Promise(r => setTimeout(r, ProjectSettings.IDLE_ENTRY_DELAY_MS));
-        
+
         if (pr.prizeController) pr.prizeController.resetWinState();
         if (pr.setBetController) pr.setBetController.resetVariables();
 
@@ -2930,6 +2953,8 @@ class GameIdle extends FlowState {
         }
         const playPanel = pr.gameLayout.descendantsByName.PlayPanel;
         if (playPanel) playPanel.enable();
+        const bgPanel = pr.gameLayout.descendantsByName.BGPanel;
+        if (bgPanel) bgPanel.enable();
         if (pr.systemMessageController) pr.systemMessageController.showMessage(1);
     }
 }
@@ -3005,7 +3030,18 @@ class PrizeWin extends FlowState {
     async showWinPanel() {
         if (pr.prizeController && pr.prizeController.isWinningState) {
             const typeId = pr.prizeController.winningType;
-            if (typeId) {
+            const winAmount = Number(pr.setBetController?.currentTicketWinAmount) || 0;
+            const totalBet = ProjectSettings.TOTAL_BET_CREDITS;
+            // UK/Ontario: no celebratory audio/visual treatment for a return
+            // that is less than or equal to the total amount wagered -- the win
+            // amount itself still displays via displayTotalWin(), this only
+            // gates the "you won" banner + SFX celebration. Only actually
+            // applies in a jurisdiction configured to require it (see
+            // ProjectSettings.WIN_CELEBRATION_GATED_JURISDICTIONS) -- NJ (the
+            // only jurisdiction actually shipped today) has no such rule, so
+            // every win celebrates there regardless of amount.
+            const gateApplies = pr.wrapperManager?.requiresWinCelebrationGate?.() ?? false;
+            if (typeId && (!gateApplies || winAmount > totalBet)) {
                 pr.prizeController.showWinPanel(typeId);
             }
         }
@@ -3035,20 +3071,42 @@ class MovesRevealed extends FlowState {
 
         const assetsSource = nc.graphicAssets || nc.assets || {};
 
-        // The 6 symbols the player already tapped (currentScenarioMoves) came
-        // out of a 30-card pool -- 18 BLANK, 3 each of UP/DOWN/LEFT/RIGHT,
-        // per Math_Clawfest_V4. The remaining 24 buttons should reveal the
-        // other 24 cards from that same pool, not a flat 5-symbol resample --
-        // a uniform pick shows ~20% blank where the rules say ~60%.
-        const pool = this.buildRemainingPool(controller.currentScenarioMoves);
+        // The ghost reveal must come from the same 30-card pool the real
+        // scenario was dealt from -- 18 BLANK, 3 each of UP/DOWN/LEFT/RIGHT
+        // (see Tools/verify-clawfest-6-math.py, which verifies this exact
+        // composition against the deployed config) -- minus the 6 cards the
+        // ticket's own scenario already drew this round. A flat, uniform
+        // pick across the 5 direction labels (previously used here) gives
+        // ~20% blank instead of the correct ~60%, and doesn't reproduce the
+        // per-tier probabilities the math relies on.
+        const fullPool = [
+            ...Array(18).fill("BLANK"),
+            ...Array(3).fill("UP"),
+            ...Array(3).fill("DOWN"),
+            ...Array(3).fill("LEFT"),
+            ...Array(3).fill("RIGHT")
+        ];
+        const remainingPool = fullPool.slice();
+        const drawnMoves = Array.isArray(controller.currentScenarioMoves) ? controller.currentScenarioMoves : [];
+        drawnMoves.forEach(move => {
+            const idx = remainingPool.indexOf(move);
+            if (idx !== -1) remainingPool.splice(idx, 1);
+        });
+        // Fisher-Yates shuffle so the remaining cards land on the unused
+        // buttons in a random order, same as an unbiased deal would.
+        for (let i = remainingPool.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [remainingPool[i], remainingPool[j]] = [remainingPool[j], remainingPool[i]];
+        }
+        let poolCursor = 0;
 
         for (let i = 0; i < controller.dirButtons.length; i++) {
             const btn = controller.dirButtons[i];
             if (!btn) continue;
             if (btn.isUsed) continue;
 
-            const symbol = pool.length > 0 ? pool.pop() : this.randomFallbackSymbol();
-            const dir = pr.wrapperManager.mapScenarioDirection(symbol);
+            const rawDir = poolCursor < remainingPool.length ? remainingPool[poolCursor++] : "BLANK";
+            const dir = pr.wrapperManager.mapScenarioDirection(rawDir);
 
             // Apply the direction graphic to the button.
             const asset = assetsSource[`button_${dir}`];
@@ -3056,6 +3114,8 @@ class MovesRevealed extends FlowState {
                 if (typeof btn.setGraphicAsset === "function") btn.setGraphicAsset(asset);
                 else btn.texture = asset;
             }
+
+            if (pr.audioController) pr.audioController.playSFX("18_button_reveal");
 
             btn.buttonActive = false;
             if (btn.colorMultiply) {
@@ -3085,41 +3145,6 @@ class MovesRevealed extends FlowState {
 
     wait(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
-    }
-
-    /**
-     * The real 30-card pool (18 BLANK, 3 each UP/DOWN/LEFT/RIGHT) with the 6
-     * already-dealt symbols removed, shuffled. Popped from for each of the
-     * 24 ghost buttons, so the reveal is drawn without replacement from
-     * exactly what's left in the deck -- matching the real blank rate
-     * instead of resampling all 5 symbols uniformly.
-     */
-    buildRemainingPool(dealtSymbols) {
-        const pool = [];
-        for (let i = 0; i < 18; i++) pool.push("BLANK");
-        for (let i = 0; i < 3; i++) pool.push("UP", "DOWN", "LEFT", "RIGHT");
-
-        for (const sym of dealtSymbols || []) {
-            const idx = pool.indexOf(sym);
-            if (idx !== -1) pool.splice(idx, 1);
-        }
-
-        // Fisher-Yates -- pool.pop() below then reveals in random order.
-        for (let i = pool.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [pool[i], pool[j]] = [pool[j], pool[i]];
-        }
-        return pool;
-    }
-
-    /**
-     * Only reached if dirButtons.length - 6 ever exceeds the 24-card
-     * remaining pool (a layout/config mismatch) -- keeps the reveal from
-     * breaking outright rather than representing the real deck.
-     */
-    randomFallbackSymbol() {
-        const symbols = ["BLANK", "UP", "DOWN", "LEFT", "RIGHT"];
-        return symbols[Math.floor(Math.random() * symbols.length)];
     }
 }
 /**
@@ -3164,6 +3189,10 @@ class GameWrapperManager {
         this._isSyncingStake = false;
 
         this.lastAction = null;
+
+        // See ProjectCode/LocalRgs.js -- set by setupLocalRgs() in init() when
+        // LocalRgs.shouldEnable() opts in. null means "talk to the real RGS".
+        this.localRgs = null;
 
         // Single game. Total bet is fixed at 6 credits per Math_Clawfest_V4;
         // the player varies denomination, not credit count.
@@ -3292,17 +3321,6 @@ class GameWrapperManager {
     async init() {
         this.loadingScreenStartedAt = performance.now();
 
-        // This build runs with GameWrapper turned off entirely -- see
-        // ProjectSettings.GAME_WRAPPER_DISABLED. Skips the wrapper library,
-        // wrapper-config.json, and every RGS call; the game runs purely on
-        // the local mock ticket (_getMockTicket()) regardless of publish state.
-        if (ProjectSettings.GAME_WRAPPER_DISABLED) {
-            this.isWrapperEnabled = false;
-            this.state = "active";
-            console.log("[GW] GameWrapper disabled via ProjectSettings.GAME_WRAPPER_DISABLED -- running on the local mock ticket only.");
-            return;
-        }
-
         let isPublished = true;
         ;
 
@@ -3314,10 +3332,51 @@ class GameWrapperManager {
             }
         }
 
+        // LocalRgs -- lets the game run with zero network calls to the real
+        // RGS, for offline dev/QA. Only takes effect when explicitly
+        // requested (LocalRgs.shouldEnable() checks
+        // ProjectSettings.LOCAL_RGS_ENABLED_BY_DEFAULT, ?localrgs=1/?local-rgs=1,
+        // and a localStorage flag). By default this also skips the real
+        // GameWrapper library entirely (isPublished forced false below, same
+        // as the existing editor/unpublished path) -- RGS calls are served
+        // by direct in-process calls into LocalRgs from callRgsMethod(), no
+        // wrapper instance and no XHR involved at all. Pass
+        // ?localrgs-wrapper=1 / ProjectSettings.LOCAL_RGS_LOAD_WRAPPER to
+        // opt into loading the real wrapper anyway, with its RGS calls
+        // served via a transport intercept instead -- see
+        // ProjectCode/LocalRgs.js for both modes.
+        //
+        // "LocalDev" IS a real, project-registered conditional code tag
+        // (see conditionalCodeTagDefinitions / configurations.LocalDev in
+        // ProjectSettings.json at the repo root, not ProjectCode/ProjectSettings.js)
+        // -- distinct from the built-in *___published/*___unpublished pair
+        // above. Every Publishing/Builds/*_LocalDev output (all of them, so
+        // far) explicitly includes "LocalDev" in conditionalCodeTagsIncluded,
+        // so this block ships in those; a WebPublish/EgmPublish configuration
+        // that does NOT list "LocalDev" there would have it stripped. (An
+        // earlier version of this comment claimed the tag was unrecognised
+        // and never stripped -- that was wrong; corrected 3 Sep 2026.)
+        ;
+        if (LocalRgs.shouldEnable()) {
+            this.localRgs = new LocalRgs(this);
+            const localRgsReady = await this.localRgs.enable();
+            if (localRgsReady) {
+                // Default: standalone -- no GameWrapper library loaded at all,
+                // RGS calls served by direct in-process calls into LocalRgs
+                // (see callRgsMethod() below). Opt into loading the real
+                // wrapper instead (RGS calls served via transport intercept)
+                // with ?localrgs-wrapper=1 / ProjectSettings.LOCAL_RGS_LOAD_WRAPPER.
+                isPublished = LocalRgs.shouldLoadWrapper();
+            }
+        }
+        ;
+
         if (!isPublished) {
             this.isWrapperEnabled = false;
             this.state = "active";
-            console.log("[GW] Skipping wrapper init in editor/unpublished runtime");
+            console.log(this.localRgs?.enabled
+                ? "[GW] LocalRgs standalone mode -- no GameWrapper library loaded, RGS calls served locally"
+                : "[GW] Skipping wrapper init in editor/unpublished runtime");
             return;
         }
 
@@ -3504,12 +3563,15 @@ class GameWrapperManager {
             || new URLSearchParams(window.location.search).get('jwt')
             || this.extractJwtFromCookie();
         
-        // RPC URL can be overridden by launch context or URL params
+        // RPC URL can be overridden by launch context or URL params. When
+        // LocalRgs is active it always wins -- see ProjectCode/LocalRgs.js.
         const urlParams = new URLSearchParams(window.location.search);
-        const rpcUrl = launchContext?.raw?.rpcUrl 
-            || urlParams.get('rpcUrl')
-            || urlParams.get('rpc-url')
-            || "https://gromada-dev.finrings.com/api/rpc";
+        const rpcUrl = this.localRgs?.enabled
+            ? LocalRgs.RPC_URL
+            : (launchContext?.raw?.rpcUrl
+                || urlParams.get('rpcUrl')
+                || urlParams.get('rpc-url')
+                || "https://gromada-dev.finrings.com/api/rpc");
 
         const defaultWrapperConfig = {
             gameId,
@@ -3521,7 +3583,8 @@ class GameWrapperManager {
                 jwt,
                 nyxGameId: urlParams.get('nyxGameId') || gameId,
                 currency: urlParams.get('currency') || "USD",
-                isPlayForFun: urlParams.get('isPlayForFun') === 'true' || urlParams.get('demo') === 'true'
+                isPlayForFun: urlParams.get('isPlayForFun') === 'true' || urlParams.get('demo') === 'true',
+                jurisdiction: this.getJurisdictionCode() || undefined
             },
             rpcUrl,
             ui: {
@@ -3951,7 +4014,7 @@ class GameWrapperManager {
      * Returns the ticket object containing the scenario for claw movement.
      */
     async purchaseTicket(bet) {
-        if (!this.isWrapperEnabled) {
+        if (!this.isWrapperEnabled && !this.localRgs?.enabled) {
             return this._getMockTicket(bet);
         }
 
@@ -3970,7 +4033,7 @@ class GameWrapperManager {
      * Settle the current ticket after the game round is complete.
      */
     async settleTicket() {
-        if (!this.isWrapperEnabled) {
+        if (!this.isWrapperEnabled && !this.localRgs?.enabled) {
             // Dev mode: simulate balance update after win
             if (pr?.setBetController?.currentTicketWinAmount > 0) {
                 const dc = pr?.dashboardController;
@@ -4001,11 +4064,50 @@ class GameWrapperManager {
         }
     }
 
+    // -------------------------------------------------------
+    // Mid-round resume -- setTicketData() / getTicketData()
+    // -------------------------------------------------------
+
+    /**
+     * Best-effort persistence of in-round progress via the RGS's native
+     * setTicketData(), so a disconnect mid-round can resume the actual
+     * animation instead of only settling straight to the final result
+     * (NJ/Pennsylvania/Michigan/UK/Malta all ask for the former). This must
+     * never block or fail gameplay -- errors are swallowed, not surfaced.
+     */
+    async saveTicketProgress(progress) {
+        if ((!this.isWrapperEnabled && !this.localRgs?.enabled) || !this.currentTicket) return;
+        try {
+            await this.callRgsMethod("setTicketData", [progress]);
+        } catch (err) {
+            console.warn("[GW] setTicketData failed (non-fatal):", err);
+        }
+    }
+
+    /**
+     * Best-effort read-back of saveTicketProgress()'s data for a given
+     * ticket (used during unsettled-ticket recovery, before the ticket has
+     * been assigned as this.currentTicket). Returns null on any failure or
+     * if nothing was ever saved for it -- callers must treat that the same
+     * as "no saved progress" and fall back to settling immediately.
+     */
+    async loadTicketProgress(ticketId) {
+        if (!this.isWrapperEnabled && !this.localRgs?.enabled) return null;
+        try {
+            const raw = await this.callRgsMethod("getTicketData", ticketId ? [ticketId] : []);
+            if (!raw) return null;
+            return typeof raw === "string" ? JSON.parse(raw) : raw;
+        } catch (err) {
+            console.warn("[GW] getTicketData failed (non-fatal):", err);
+            return null;
+        }
+    }
+
     /**
      * Refresh balance from RGS and update the dashboard.
      */
     async syncBalance() {
-        if (!this.isWrapperEnabled) return;
+        if (!this.isWrapperEnabled && !this.localRgs?.enabled) return;
         try {
             const account = await this.callRgsMethod("getAccount");
             const balance = Number(account?.balance) || 0;
@@ -4044,110 +4146,61 @@ class GameWrapperManager {
         ];
     }
 
-    // -------------------------------------------------------
-    // Mock ticket (editor / no-wrapper fallback)
-    //
-    // Hardcoded from Math_Clawfest_V4 / clawfest-6.json so this behaves the
-    // same in the Incisor editor (fetching clawfest-6.json at runtime is
-    // not reliable there) and in a published build -- no file I/O at all.
-    //
-    // The 17-level prize table below (level, win amount, probability) is
-    // copied straight from clawfest-6.json's prize[] array -- same
-    // fractions the real RGS uses -- and picked with a single weighted
-    // roll, so the odds are the real ones, not a re-derived approximation.
-    // A plausible 6-move walk is then generated to land on whichever tile
-    // that level implies, purely for the on-screen claw animation.
-    // -------------------------------------------------------
+    _getMockTicket(bet) {
+        // Dev/editor-only fallback for when there is no live RGS connection.
+        // Deals from the same 30-card pool the real scenario uses (18 BLANK,
+        // 3 each of UP/DOWN/LEFT/RIGHT -- see Tools/verify-clawfest-6-math.py,
+        // which verifies this exact composition against the deployed config)
+        // instead of an even 4-way pick with no BLANK at all, and pays out
+        // from the real per-tier amounts in clawfest-6.json's "prize" array
+        // (levels 1-6 map onto Manhattan tiers 1-6 by construction -- there
+        // are exactly six of each; levels 7-16 are the ten equal-probability
+        // Mystery Grab sub-prizes, awarded on landing at center per the
+        // verified 12.5%-conditional trigger rate) instead of a made-up
+        // 150/70/11/7/2 table with no top prize. These numbers are hand-
+        // copied from the deployed config since this path never talks to
+        // the RGS to fetch it live -- keep them in sync if clawfest-6.json's
+        // prize table ever changes.
+        const GRID_PRIZES = [0, 1, 5, 11, 70, 150, 7500]; // index = Manhattan tier (0-6)
+        const MYSTERY_PRIZES = [30, 36, 42, 48, 54, 60, 66, 72, 78, 84]; // levels 7-16
+        const MYSTERY_TRIGGER_PROB = 0.125; // conditional on landing at center
 
-    // level, winAmount, probability -- verbatim from clawfest-6.json prize[].
-    static get MOCK_PRIZE_TABLE() {
-        return [
-            { level: 1,  winAmount: 1,    p: 3624 / 9425 },
-            { level: 2,  winAmount: 5,    p: 68 / 203 },
-            { level: 3,  winAmount: 11,   p: 22616 / 197925 },
-            { level: 4,  winAmount: 70,   p: 148 / 9425 },
-            { level: 5,  winAmount: 150,  p: 48 / 65975 },
-            { level: 6,  winAmount: 7500, p: 4 / 593775 },
-            { level: 7,  winAmount: 30,   p: 17791 / 9500400 },
-            { level: 8,  winAmount: 36,   p: 17791 / 9500400 },
-            { level: 9,  winAmount: 42,   p: 17791 / 9500400 },
-            { level: 10, winAmount: 48,   p: 17791 / 9500400 },
-            { level: 11, winAmount: 54,   p: 17791 / 9500400 },
-            { level: 12, winAmount: 60,   p: 17791 / 9500400 },
-            { level: 13, winAmount: 66,   p: 17791 / 9500400 },
-            { level: 14, winAmount: 72,   p: 17791 / 9500400 },
-            { level: 15, winAmount: 78,   p: 17791 / 9500400 },
-            { level: 16, winAmount: 84,   p: 17791 / 9500400 },
+        const pool = [
+            ...Array(18).fill("BLANK"),
+            ...Array(3).fill("UP"),
+            ...Array(3).fill("DOWN"),
+            ...Array(3).fill("LEFT"),
+            ...Array(3).fill("RIGHT")
         ];
-    }
-
-    _pickMockPrize() {
-        const table = GameWrapperManager.MOCK_PRIZE_TABLE;
-        let roll = Math.random();
-        for (const row of table) {
-            if (roll < row.p) return row;
-            roll -= row.p;
-        }
-        return null; // remaining probability mass -> level 0, no win
-    }
-
-    /**
-     * A plausible 6-card walk that lands at the given Manhattan-distance
-     * tier (0 = center). Only the landing tile has to be right -- winAmount
-     * itself already came from _pickMockPrize(), not from this walk.
-     */
-    _buildMockWalk(targetTier) {
-        const minA = Math.max(0, targetTier - 3);
-        const maxA = Math.min(3, targetTier);
-        const a = minA + Math.floor(Math.random() * (maxA - minA + 1));
-        const b = targetTier - a;
-
-        const symbols = [];
-        if (a > 0) {
-            const horiz = Math.random() < 0.5 ? "LEFT" : "RIGHT";
-            for (let i = 0; i < a; i++) symbols.push(horiz);
-        }
-        if (b > 0) {
-            const vert = Math.random() < 0.5 ? "UP" : "DOWN";
-            for (let i = 0; i < b; i++) symbols.push(vert);
-        }
-        // Tier 0 (center): let the walk cancel itself out with an
-        // opposite-direction pair half the time instead of always dealing
-        // 6 blanks, so the reveal isn't identical every center round.
-        if (targetTier === 0 && Math.random() < 0.5) {
-            const pairAxis = Math.random() < 0.5 ? ["UP", "DOWN"] : ["LEFT", "RIGHT"];
-            symbols.push(pairAxis[0], pairAxis[1]);
-        }
-        while (symbols.length < 6) symbols.push("BLANK");
-
-        // Fisher-Yates -- so the real moves aren't always dealt first.
-        for (let i = symbols.length - 1; i > 0; i--) {
+        for (let i = pool.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
-            [symbols[i], symbols[j]] = [symbols[j], symbols[i]];
+            [pool[i], pool[j]] = [pool[j], pool[i]];
         }
+        const moves = pool.slice(0, 6);
 
         const positions = [];
         let x = 0, y = 0;
-        for (const dir of symbols) {
-            if (dir === "UP")         y = Math.max(-3, y - 1);
-            else if (dir === "DOWN")  y = Math.min(3, y + 1);
-            else if (dir === "LEFT")  x = Math.max(-3, x - 1);
+        moves.forEach(dir => {
+            if (dir === "DOWN")       y = Math.min(3, y + 1);
+            else if (dir === "UP")    y = Math.max(-3, y - 1);
             else if (dir === "RIGHT") x = Math.min(3, x + 1);
+            else if (dir === "LEFT")  x = Math.max(-3, x - 1);
             positions.push([x, y]);
+        });
+
+        const tier = Math.abs(x) + Math.abs(y);
+        let winAmount = 0;
+        let prizeLevel = 0;
+        if (tier === 0) {
+            if (Math.random() < MYSTERY_TRIGGER_PROB) {
+                const mysteryIndex = Math.floor(Math.random() * MYSTERY_PRIZES.length);
+                winAmount = MYSTERY_PRIZES[mysteryIndex];
+                prizeLevel = 7 + mysteryIndex;
+            }
+        } else {
+            winAmount = GRID_PRIZES[tier] || 0;
+            prizeLevel = tier;
         }
-        return { moves: symbols, positions };
-    }
-
-    _getMockTicket(bet) {
-        const picked = this._pickMockPrize();
-        const winAmount = picked ? picked.winAmount : 0;
-        const prizeLevel = picked ? picked.level : 0;
-        const isGridWin = picked && picked.level >= 1 && picked.level <= 6;
-
-        // Grid levels (1-6) land at Manhattan distance === level; level 0
-        // and Mystery Grab levels (7-16) all land on center (tier 0).
-        const targetTier = isGridWin ? picked.level : 0;
-        const { moves, positions } = this._buildMockWalk(targetTier);
 
         const scenario = JSON.stringify({ s: moves, p: positions });
         return {
@@ -4164,8 +4217,17 @@ class GameWrapperManager {
     // -------------------------------------------------------
     async callRgsMethod(methodName, args = []) {
         console.log(`[GW] callRgsMethod: ${methodName}`, args);
-        
+
         if (!this.wrapper?.rgs) {
+            // Standalone LocalRgs (no GameWrapper instantiated) -- call the
+            // matching method on LocalRgs directly instead of the real
+            // adapter. Same method names/argument order as a real Rgs
+            // adapter, so every existing call site works unmodified.
+            if (this.localRgs?.enabled && typeof this.localRgs[methodName] === "function") {
+                const result = await this.localRgs[methodName].apply(this.localRgs, Array.isArray(args) ? args : []);
+                console.log(`[GW] LocalRgs (direct) ${methodName} returned:`, result);
+                return result;
+            }
             throw new Error(`[GW] RGS adapter unavailable for method: ${methodName}`);
         }
         const fn = this.wrapper.rgs[methodName];
@@ -4469,11 +4531,57 @@ class GameWrapperManager {
     // -------------------------------------------------------
     // Dashboard helpers
     // -------------------------------------------------------
-    formatAmount(amount) {
+    formatAmount(amount, trimFraction = false) {
+        let formatted;
         if (this.wrapper?.formatCurrency) {
-            try { return this.wrapper.formatCurrency(Number(amount)); } catch (_) {}
+            try { formatted = this.wrapper.formatCurrency(Number(amount), trimFraction); } catch (_) {}
         }
-        return "$" + Number(amount).toFixed(2);
+        if (formatted === undefined || formatted === null) {
+            const num = Number(amount) || 0;
+            formatted = trimFraction ? ("$" + num.toFixed(0)) : ("$" + num.toFixed(2));
+        }
+        // No comma-glyph asset exists yet in the digit-sprite set (cb_num_0-9,
+        // cb_dot, cb_dollar only -- see DashboardController.getAssetForChar()).
+        // Until one is added, strip thousands separators here so the sprite
+        // renderer does not silently drop the comma and misalign the digits
+        // after it (or shift the centring math in renderValue()).
+        return String(formatted).replace(/,/g, "");
+    }
+
+    /**
+     * Current jurisdiction code, read straight from the ?jurisdiction= URL
+     * param (the same key libs/gamewrapper reads as params['jurisdiction']
+     * to pick which jurisdiction/<code>.json to load). Works identically
+     * whether the real wrapper is running or not (LocalRgs standalone mode
+     * included), since it never depends on the wrapper's own async
+     * jurisdictionReady/gameJurisdiction -- see ProjectSettings.js's
+     * WIN_CELEBRATION_GATED_JURISDICTIONS for the one place this is used.
+     * Returns lowercase, or null if the param is absent.
+     */
+    getJurisdictionCode() {
+        try {
+            const code = new URLSearchParams(window.location.search).get('jurisdiction');
+            return code ? code.toLowerCase() : null;
+        } catch (_err) {
+            return null;
+        }
+    }
+
+    /**
+     * Whether the current jurisdiction requires gating the "You Won!"
+     * banner/SFX for a win <= the total bet (see ProjectSettings.js's
+     * WIN_CELEBRATION_GATED_JURISDICTIONS doc comment). Defaults to false
+     * for an empty/unrecognised jurisdiction -- including NJ, the only one
+     * actually shipped today -- so every win celebrates unless a market
+     * that needs the gate is explicitly configured.
+     */
+    requiresWinCelebrationGate() {
+        const code = this.getJurisdictionCode();
+        if (!code) return false;
+        const gated = Array.isArray(ProjectSettings?.WIN_CELEBRATION_GATED_JURISDICTIONS)
+            ? ProjectSettings.WIN_CELEBRATION_GATED_JURISDICTIONS
+            : [];
+        return gated.includes(code);
     }
 
     updateBalanceDisplay(balance) {
@@ -4724,12 +4832,914 @@ class GameWrapperManager {
 }
 
 window.GameWrapperManager = GameWrapperManager;
+/**
+ * LocalRgs
+ * ----------------------------------------------------------------------
+ * An in-browser stand-in for the Gromada/Fingenuity RGS, so Clawfest can be
+ * built, launched and played end-to-end -- through the *real* GameWrapper
+ * library, with the *real* wrapper UI/lifecycle -- without any network
+ * connection to an actual RGS. Recreated from the design description in
+ * claude/clawfest-local-rgs.md (the original file was lost; git history on
+ * every branch does not actually contain it despite an earlier commit
+ * message claiming to restore it -- see that doc's "Status" section).
+ *
+ * HOW IT INTERCEPTS
+ * -----------------
+ * ScratchcardRgs (libs/gamewrapper/gamewrapper.es.js) talks to the RGS over
+ * a single choke point: Rgs.prototype.invoke() opens an XMLHttpRequest,
+ * POSTs a JSON body shaped {serviceName, methodName, arguments}, and
+ * resolves with xmlHttp.responseText. Every fixed-odds call --
+ * GetGame/GetUnsettledTicket/PurchaseTicket/PurchaseUsingBonus/
+ * SettleTicket/GetAccount/GetTicketData/SetTicketData -- goes through that
+ * one method. Swapping methods on the wrapper's own rgs instance is
+ * unreliable against the minified build (property assignment races the
+ * wrapper's own constructor in places), so instead this patches
+ * XMLHttpRequest.prototype itself: any request whose body matches the
+ * {serviceName, methodName, arguments} shape is answered locally --
+ * everything else (asset fetches, the wrapper's own JS bundle, etc.) is
+ * left completely alone. Transport and guard are installed in
+ * setupLocalRgs(), before the wrapper is constructed, so the wrapper's
+ * very first RGS call is already local.
+ *
+ * OFFLINE MODE
+ * ------------
+ * When ProjectSettings.LOCAL_RGS_OFFLINE_GUARD is true (the default),
+ * LocalRgs also patches fetch/WebSocket/sendBeacon and XMLHttpRequest.open
+ * to refuse any *other* cross-origin request outright, so a build running
+ * under LocalRgs can be demonstrated on a machine with no network access at
+ * all and still fail loudly (rather than hang) if something unexpected
+ * tries to phone home. Same-origin requests, data:/blob: URLs, and hosts
+ * added via localRgs.allowHost() are always let through.
+ *
+ * TURNING IT ON
+ * -------------
+ * Off by default. Any one of the following arms it, checked once in
+ * LocalRgs.shouldEnable() before the wrapper would otherwise be built:
+ *   - ProjectSettings.LOCAL_RGS_ENABLED_BY_DEFAULT === true
+ *   - ?localrgs=1 or ?local-rgs=1 in the URL
+ *   - localStorage.clawfest_local_rgs === "1"
+ *
+ * By default, enabling LocalRgs also skips the real GameWrapper library
+ * entirely -- no wrapper JS is loaded, no wrapper UI/bottom bar exists, and
+ * GameWrapperManager drives the game's own dashboard UI directly against
+ * LocalRgs's in-process methods (getGame/getAccount/purchaseTicket/etc.),
+ * the same way it already does calls when the transport is intercepted, just
+ * without an XHR round-trip or a wrapper instance in between. This is the
+ * "not connected to the RGS *and* not relying on GameWrapper" mode the
+ * class exists for.
+ *
+ * Pass ?localrgs-wrapper=1 (or ProjectSettings.LOCAL_RGS_LOAD_WRAPPER: true)
+ * alongside the flag above to opt into the other mode instead: the real
+ * GameWrapper library still loads and is instantiated normally, and its own
+ * RGS calls are served locally by intercepting XMLHttpRequest -- useful for
+ * exercising the actual wrapper UI/lifecycle offline. See
+ * LocalRgs.shouldLoadWrapper() and GameWrapperManager.init().
+ *
+ * CONSOLE API
+ * -----------
+ * Once enabled, window.localRgs exposes:
+ *   help()                    -- print this list
+ *   report()                  -- current balance / tickets settled / totals
+ *   levelSummary()             -- per-level probability, weight, win amount
+ *   verify()                   -- re-derive RTP/hit-rate/mystery-trigger from
+ *                                 the live probability table and print them
+ *   soak(n = 100000)           -- deal n tickets in memory (no balance/UI
+ *                                 side effects) and compare empirical vs.
+ *                                 theoretical RTP/hit-rate
+ *   forceLevel(level)          -- next PurchaseTicket always lands on `level`
+ *   forceScenario(scenarioId)  -- next PurchaseTicket always deals exactly
+ *                                 this scenario row (overrides forceLevel)
+ *   clearForce()               -- clear both of the above
+ *   setBalance(amount)         -- set the local wallet balance directly
+ *   reset()                    -- wipe all local state (balance, tickets,
+ *                                 forced level/scenario) back to defaults
+ *   setLatency(ms)             -- simulate network latency on every call
+ *   logRpc(on)                 -- toggle verbose per-call console logging
+ *   networkReport()            -- list every request the offline guard has
+ *                                 refused so far
+ *   allowHost(host)            -- allow-list an extra host for the guard
+ *
+ * CAVEATS
+ * -------
+ * - Deals from the real per-level scenario table in clawfest-6.json, picking
+ *   the level itself via exact BigInt-weighted random from each level's
+ *   probabilityUp/probabilityDown (matching Tools/verify-clawfest-6-math.py)
+ *   and then a uniformly-random real scenario row within that level -- so
+ *   RTP/hit-rate/mystery-trigger rate match the deployed math exactly, while
+ *   the s/p walk data itself is always a genuine config-derived scenario.
+ * - GetTicketData/SetTicketData are treated as an opaque per-ticket string
+ *   blob (matching the real Rgs base class, which already wraps/unwraps the
+ *   {gameData, accountData} envelope on the client side before this layer
+ *   ever sees it) -- LocalRgs never needs to construct that envelope itself.
+ * - State (balance, unsettled ticket, saved progress) persists to
+ *   localStorage so a page reload resumes exactly like a real disconnect
+ *   would; reset() wipes it.
+ * - This is a fairness/QA aid, not a production RGS: no auditing, no
+ *   cryptographic RNG requirements beyond crypto.getRandomValues(), no
+ *   multi-currency support (fixed at the config's own currency/stake).
+ */
+class LocalRgs {
+    static RPC_URL = "local://rgs";
+    static STORAGE_PREFIX = "clawfest_localrgs_v1_";
+
+    static shouldEnable() {
+        try {
+            const urlParams = new URLSearchParams(window.location.search);
+            if (urlParams.get("localrgs") === "1" || urlParams.get("local-rgs") === "1") return true;
+            if (window.localStorage?.getItem("clawfest_local_rgs") === "1") return true;
+        } catch (_err) {
+            // localStorage/URLSearchParams unavailable -- fall through to the project flag
+        }
+        return !!(window.ProjectSettings && ProjectSettings.LOCAL_RGS_ENABLED_BY_DEFAULT);
+    }
+
+    /**
+     * Whether an active LocalRgs session should also load and instantiate
+     * the real GameWrapper library (RGS calls served via the transport
+     * intercept) instead of the default standalone mode (no wrapper at all,
+     * RGS calls served by direct in-process method calls). Off by default --
+     * "not relying on GameWrapper" is the point of this class.
+     */
+    static shouldLoadWrapper() {
+        try {
+            const urlParams = new URLSearchParams(window.location.search);
+            if (urlParams.get("localrgs-wrapper") === "1") return true;
+        } catch (_err) {
+            // fall through to the project flag
+        }
+        return !!(window.ProjectSettings && ProjectSettings.LOCAL_RGS_LOAD_WRAPPER);
+    }
+
+    constructor(manager) {
+        this.manager = manager;
+        this.enabled = false;
+
+        this.gameConfig = null;
+        this.levelWeights = null;      // Map<level, BigInt weight>
+        this.denomLcm = null;          // BigInt
+        this.levelOrder = null;        // [level, ...] in config order
+        this.scenariosByLevel = null;  // Map<level, [scenarioRow, ...]>
+        this.prizeByLevel = null;      // Map<level, {winAmount, freeTicket}>
+
+        this.gameId = manager?.gameId || "clawfest-6";
+        this.currency = "USD";
+        this.balance = 1000;
+        this.tickets = new Map();      // ticketId -> {ticket, progress, settled}
+        this.unsettledTicketId = null;
+        this._ticketSeq = 0;
+
+        this.forcedLevel = null;
+        this.forcedScenarioId = null;
+        this.latencyMs = 0;
+        this.verboseLog = false;
+
+        this.networkRefusals = [];
+        this.allowedExtraHosts = new Set();
+
+        this._origXhrOpen = null;
+        this._origXhrSend = null;
+        this._origFetch = null;
+        this._origWebSocket = null;
+        this._origSendBeacon = null;
+        this._transportInstalled = false;
+        this._guardInstalled = false;
+    }
+
+    // -------------------------------------------------------
+    // Setup
+    // -------------------------------------------------------
+    async enable() {
+        if (this.enabled) return true;
+
+        try {
+            await this._loadConfig();
+        } catch (err) {
+            console.error("[LocalRgs] Could not load game config -- staying disabled:", err);
+            return false;
+        }
+
+        this._loadState();
+        this._installTransportIntercept();
+
+        const guardWanted = !window.ProjectSettings || ProjectSettings.LOCAL_RGS_OFFLINE_GUARD !== false;
+        if (guardWanted) this._installOfflineGuard();
+
+        this.enabled = true;
+        window.localRgs = this._buildConsoleApi();
+        console.log(
+            `[LocalRgs] enabled -- gameId=${this.gameId}, balance=${this.currency} ${this.balance.toFixed(2)}, ` +
+            `${this.levelOrder.length} prize levels, ${this._totalScenarios()} scenarios loaded. Try localRgs.help().`
+        );
+        return true;
+    }
+
+    // -------------------------------------------------------
+    // Direct call API -- standalone mode (no GameWrapper instantiated)
+    // -------------------------------------------------------
+    // GameWrapperManager.callRgsMethod() calls these the same way it would
+    // call the matching method on a real Rgs adapter instance (same method
+    // names, same argument order) whenever this.wrapper is null but
+    // this.localRgs is enabled. They wrap the same _handleXxx() logic the
+    // transport intercept uses, so both modes deal identical outcomes from
+    // identical state -- this is just a second front door onto it, with an
+    // optional simulated-latency delay instead of an XHR round trip.
+    //
+    // Real adapter method signatures (see libs/gamewrapper/gamewrapper.es.js)
+    // don't always match the wire envelope's argument order -- most notably
+    // setTicketData(data, ticketId), data first -- so these mirror the real
+    // adapter's own argument order, not _routeMethod()'s wire order.
+
+    async getGame() {
+        return this._callLocal(() => this._handleGetGame());
+    }
+
+    async getAccount() {
+        return this._callLocal(() => this._handleGetAccount());
+    }
+
+    async getUnsettledTicket() {
+        return this._callLocal(() => this._handleGetUnsettledTicket());
+    }
+
+    async purchaseTicket(bet) {
+        return this._callLocal(() => this._handlePurchaseTicket(bet));
+    }
+
+    async settleTicket(ticketId) {
+        return this._callLocal(() => this._handleSettleTicket(ticketId));
+    }
+
+    async getTicketData(ticketId) {
+        return this._callLocal(() => this._handleGetTicketData(ticketId));
+    }
+
+    async setTicketData(data, ticketId) {
+        return this._callLocal(() => this._handleSetTicketData(ticketId, data));
+    }
+
+    /** Runs a handler with the same latency simulation and error semantics as the transport intercept, without any XHR. */
+    async _callLocal(fn) {
+        if (this.latencyMs > 0) {
+            await new Promise(resolve => setTimeout(resolve, this.latencyMs));
+        }
+        try {
+            const result = fn();
+            if (this.verboseLog) console.log("[LocalRgs] (direct)", result);
+            return result;
+        } catch (err) {
+            console.warn("[LocalRgs] (direct) call failed:", err);
+            throw err;
+        }
+    }
+
+    async _loadConfig() {
+        const candidatePaths = (window.ProjectSettings && Array.isArray(ProjectSettings.LOCAL_RGS_CONFIG_PATHS))
+            ? ProjectSettings.LOCAL_RGS_CONFIG_PATHS
+            : ["./ProjectCode/clawfest-6.json", "./clawfest-6.json", "./Publishing/Builds/clawfest-6.json"];
+
+        let config = null;
+        let lastErr = null;
+        for (const path of candidatePaths) {
+            try {
+                const response = await fetch(path, { cache: "no-store" });
+                if (!response.ok) continue;
+                config = await response.json();
+                if (config && Array.isArray(config.prize) && Array.isArray(config.scenario)) {
+                    console.log("[LocalRgs] Loaded game config from", path);
+                    break;
+                }
+                config = null;
+            } catch (err) {
+                lastErr = err;
+            }
+        }
+
+        if (!config) {
+            throw lastErr || new Error("clawfest-6.json not found at any candidate path");
+        }
+
+        this.gameConfig = config;
+        this.gameId = config.gameId || this.gameId;
+        const stakes = Array.isArray(config.ticketPrice) ? config.ticketPrice.map(Number).filter(Number.isFinite) : [6];
+        this.defaultBet = stakes[0] || 6;
+
+        this._buildProbabilityTable();
+        this._indexScenariosByLevel();
+    }
+
+    // -------------------------------------------------------
+    // Exact-arithmetic prize dealing (BigInt -- nothing here rounds)
+    // -------------------------------------------------------
+    static _gcd(a, b) {
+        a = a < 0n ? -a : a;
+        b = b < 0n ? -b : b;
+        while (b) { [a, b] = [b, a % b]; }
+        return a;
+    }
+
+    static _lcm(a, b) {
+        if (a === 0n || b === 0n) return 0n;
+        return (a / LocalRgs._gcd(a, b)) * b;
+    }
+
+    _buildProbabilityTable() {
+        const levels = this.gameConfig.prize;
+        let denomLcm = 1n;
+        for (const p of levels) {
+            if (p.probabilityUp != null && p.probabilityDown != null) {
+                denomLcm = LocalRgs._lcm(denomLcm, BigInt(p.probabilityDown));
+            }
+        }
+
+        const weights = new Map();
+        const prizeByLevel = new Map();
+        let sumExplicit = 0n;
+        let remainderLevel = null;
+
+        for (const p of levels) {
+            prizeByLevel.set(p.level, { winAmount: Number(p.winAmount) || 0, freeTicket: !!p.freeTicket });
+            if (p.probabilityUp != null && p.probabilityDown != null) {
+                const w = (denomLcm / BigInt(p.probabilityDown)) * BigInt(p.probabilityUp);
+                weights.set(p.level, w);
+                sumExplicit += w;
+            } else {
+                remainderLevel = p.level;
+            }
+        }
+
+        if (remainderLevel !== null) {
+            weights.set(remainderLevel, denomLcm - sumExplicit);
+        }
+
+        this.denomLcm = denomLcm;
+        this.levelWeights = weights;
+        this.levelOrder = levels.map(p => p.level);
+        this.prizeByLevel = prizeByLevel;
+    }
+
+    _indexScenariosByLevel() {
+        const map = new Map();
+        for (const row of this.gameConfig.scenario) {
+            if (!map.has(row.prizeLevel)) map.set(row.prizeLevel, []);
+            map.get(row.prizeLevel).push(row);
+        }
+        this.scenariosByLevel = map;
+    }
+
+    _totalScenarios() {
+        let total = 0;
+        for (const rows of this.scenariosByLevel.values()) total += rows.length;
+        return total;
+    }
+
+    /** Uniform, unbiased random BigInt in [0, n) via rejection sampling. */
+    _randomBigIntBelow(n) {
+        if (n <= 0n) return 0n;
+        const byteLen = Math.max(1, Math.ceil(n.toString(2).length / 8));
+        const spaceSize = 1n << BigInt(byteLen * 8);
+        const limit = spaceSize - (spaceSize % n);
+        const buf = new Uint8Array(byteLen);
+        let x;
+        do {
+            crypto.getRandomValues(buf);
+            x = 0n;
+            for (const b of buf) x = (x << 8n) | BigInt(b);
+        } while (x >= limit);
+        return x % n;
+    }
+
+    _pickLevel() {
+        if (this.forcedLevel !== null && this.levelWeights.has(this.forcedLevel)) {
+            return this.forcedLevel;
+        }
+        let roll = this._randomBigIntBelow(this.denomLcm);
+        for (const level of this.levelOrder) {
+            const w = this.levelWeights.get(level) || 0n;
+            if (roll < w) return level;
+            roll -= w;
+        }
+        return this.levelOrder[this.levelOrder.length - 1];
+    }
+
+    _pickScenarioRow(level) {
+        if (this.forcedScenarioId !== null) {
+            for (const rows of this.scenariosByLevel.values()) {
+                const hit = rows.find(r => r.scenarioID === this.forcedScenarioId);
+                if (hit) return hit;
+            }
+            console.warn(`[LocalRgs] forceScenario(${this.forcedScenarioId}) not found in config -- falling back to level roll.`);
+        }
+        const rows = this.scenariosByLevel.get(level);
+        if (!rows || rows.length === 0) return null;
+        const idx = Number(this._randomBigIntBelow(BigInt(rows.length)));
+        return rows[idx];
+    }
+
+    /** Deals one ticket outcome. Pure function of the tables -- no balance/state side effects. */
+    _deal() {
+        const level = this._pickLevel();
+        const row = this._pickScenarioRow(level);
+        const prize = this.prizeByLevel.get(level) || { winAmount: 0, freeTicket: false };
+        return { level, row, winAmount: prize.winAmount, freeTicket: prize.freeTicket };
+    }
+
+    // -------------------------------------------------------
+    // State persistence (survives a page reload like a real disconnect would)
+    // -------------------------------------------------------
+    _storageKey() {
+        return LocalRgs.STORAGE_PREFIX + this.gameId;
+    }
+
+    _loadState() {
+        const starting = (window.ProjectSettings && Number(ProjectSettings.LOCAL_RGS_STARTING_BALANCE)) || 1000;
+        this.balance = starting;
+        this.currency = "USD";
+        this.tickets = new Map();
+        this.unsettledTicketId = null;
+
+        try {
+            const raw = window.localStorage?.getItem(this._storageKey());
+            if (!raw) return;
+            const saved = JSON.parse(raw);
+            if (typeof saved.balance === "number") this.balance = saved.balance;
+            if (typeof saved.currency === "string") this.currency = saved.currency;
+            if (Array.isArray(saved.tickets)) this.tickets = new Map(saved.tickets);
+            if (saved.unsettledTicketId) this.unsettledTicketId = saved.unsettledTicketId;
+            if (typeof saved.ticketSeq === "number") this._ticketSeq = saved.ticketSeq;
+        } catch (err) {
+            console.warn("[LocalRgs] Could not read saved state (starting fresh):", err);
+        }
+    }
+
+    _saveState() {
+        try {
+            window.localStorage?.setItem(this._storageKey(), JSON.stringify({
+                balance: this.balance,
+                currency: this.currency,
+                tickets: Array.from(this.tickets.entries()),
+                unsettledTicketId: this.unsettledTicketId,
+                ticketSeq: this._ticketSeq
+            }));
+        } catch (err) {
+            console.warn("[LocalRgs] Could not persist state (non-fatal):", err);
+        }
+    }
+
+    // -------------------------------------------------------
+    // Transport intercept
+    // -------------------------------------------------------
+    _installTransportIntercept() {
+        if (this._transportInstalled) return;
+        const self = this;
+        const XHR = window.XMLHttpRequest;
+
+        this._origXhrSend = XHR.prototype.send;
+        XHR.prototype.send = function (body) {
+            const envelope = self._tryParseEnvelope(body);
+            if (envelope) {
+                self._serveEnvelope(this, envelope);
+                return;
+            }
+            return self._origXhrSend.call(this, body);
+        };
+
+        this._transportInstalled = true;
+    }
+
+    _tryParseEnvelope(body) {
+        if (typeof body !== "string" || !body) return null;
+        let parsed;
+        try {
+            parsed = JSON.parse(body);
+        } catch (_err) {
+            return null;
+        }
+        if (!parsed || typeof parsed !== "object") return null;
+        if (typeof parsed.serviceName !== "string" || typeof parsed.methodName !== "string") return null;
+        if (!Array.isArray(parsed.arguments)) return null;
+        return parsed;
+    }
+
+    _serveEnvelope(xhr, envelope) {
+        const deliver = () => {
+            let responseText;
+            try {
+                const result = this._routeMethod(envelope.methodName, envelope.arguments);
+                responseText = JSON.stringify({ result });
+                if (this.verboseLog) console.log(`[LocalRgs] ${envelope.methodName}`, envelope.arguments, "->", result);
+            } catch (err) {
+                const errorBody = (err && err.error) ? err : { error: "localRgsError", errorDetails: { message: String(err?.message || err) } };
+                responseText = JSON.stringify(errorBody);
+                console.warn(`[LocalRgs] ${envelope.methodName} failed:`, err);
+            }
+            this._completeXhr(xhr, 200, responseText);
+        };
+
+        if (this.latencyMs > 0) {
+            setTimeout(deliver, this.latencyMs);
+        } else {
+            // Still async (queued as a microtask/macrotask) so callers that
+            // assume invoke() never resolves synchronously keep working.
+            setTimeout(deliver, 0);
+        }
+    }
+
+    _completeXhr(xhr, status, responseText) {
+        const define = (prop, value) => Object.defineProperty(xhr, prop, { value, configurable: true });
+        define("readyState", 4);
+        define("status", status);
+        define("statusText", status === 200 ? "OK" : "Error");
+        define("responseText", responseText);
+        define("response", responseText);
+        define("responseURL", LocalRgs.RPC_URL);
+        define("getResponseHeader", (name) => (String(name).toLowerCase() === "jwt" ? "local-dev-jwt" : null));
+        if (typeof xhr.onreadystatechange === "function") {
+            xhr.onreadystatechange();
+        }
+    }
+
+    // -------------------------------------------------------
+    // RGS method routing
+    // -------------------------------------------------------
+    _routeMethod(methodName, args) {
+        switch (methodName) {
+            case "GetGame":
+                return this._handleGetGame();
+            case "GetUnsettledTicket":
+                return this._handleGetUnsettledTicket();
+            case "PurchaseTicket":
+            case "PurchaseUsingBonus":
+                return this._handlePurchaseTicket(args[1]);
+            case "SettleTicket":
+                return this._handleSettleTicket(args[0]);
+            case "GetAccount":
+                return this._handleGetAccount();
+            case "GetTicketData":
+                return this._handleGetTicketData(args[0]);
+            case "SetTicketData":
+                return this._handleSetTicketData(args[0], args[1]);
+            default:
+                throw { error: "unsupportedMethod", errorDetails: { message: `LocalRgs has no handler for '${methodName}'` } };
+        }
+    }
+
+    _handleGetGame() {
+        return {
+            gameConfig: this.gameConfig,
+            ticketPrice: this.gameConfig.ticketPrice,
+            stakes: this.gameConfig.ticketPrice,
+            defaultStake: this.defaultBet,
+            gameEngine: "fixed-odds",
+            game: { nextAction: this.unsettledTicketId ? "settleTicket" : "purchaseTicket" }
+        };
+    }
+
+    _handleGetAccount() {
+        return { balance: this.balance, currency: this.currency, gameId: this.gameId };
+    }
+
+    _handleGetUnsettledTicket() {
+        if (!this.unsettledTicketId) return null;
+        const record = this.tickets.get(this.unsettledTicketId);
+        return record ? record.ticket : null;
+    }
+
+    _handlePurchaseTicket(bet) {
+        if (this.unsettledTicketId) {
+            throw { error: "unsettledTicketExists", errorDetails: { ticketId: this.unsettledTicketId } };
+        }
+
+        const betAmount = Number(bet) > 0 ? Number(bet) : this.defaultBet;
+        if (betAmount > this.balance) {
+            throw { error: "insufficientFunds", errorDetails: { balance: this.balance, bet: betAmount } };
+        }
+
+        const outcome = this._deal();
+        if (!outcome.row) {
+            throw { error: "localRgsError", errorDetails: { message: `No scenario rows for level ${outcome.level}` } };
+        }
+
+        this._ticketSeq += 1;
+        const ticketId = `local-${Date.now()}-${this._ticketSeq}`;
+
+        const ticket = {
+            ticketId,
+            gameId: this.gameId,
+            ticketPrice: betAmount,
+            winAmount: outcome.winAmount,
+            freeTicket: outcome.freeTicket,
+            prize: { level: outcome.level, winAmount: outcome.winAmount },
+            prizes: [{ level: outcome.level, winAmount: outcome.winAmount, scenario: outcome.row.data }],
+            scenario: outcome.row.data,
+            scenarioID: outcome.row.scenarioID
+        };
+
+        this.balance -= betAmount;
+        this.tickets.set(ticketId, { ticket, progress: null, settled: false });
+        this.unsettledTicketId = ticketId;
+
+        this.forcedScenarioId = null; // one-shot: forceScenario() applies to exactly one purchase
+        this.forcedLevel = null;      // one-shot: forceLevel() applies to exactly one purchase
+
+        this._saveState();
+        return ticket;
+    }
+
+    _handleSettleTicket(ticketId) {
+        const id = ticketId || this.unsettledTicketId;
+        const record = id ? this.tickets.get(id) : null;
+        if (!record) {
+            throw { error: "unknownTicket", errorDetails: { ticketId: id } };
+        }
+        if (!record.settled) {
+            this.balance += record.ticket.winAmount;
+            record.settled = true;
+        }
+        if (this.unsettledTicketId === id) this.unsettledTicketId = null;
+        this._saveState();
+        return { ticketId: id, winAmount: record.ticket.winAmount, balance: this.balance, currency: this.currency };
+    }
+
+    _handleGetTicketData(ticketId) {
+        const record = ticketId ? this.tickets.get(ticketId) : null;
+        return record?.progress ?? null;
+    }
+
+    _handleSetTicketData(ticketId, data) {
+        // The real Rgs.setTicketData(data, ticketId) is called by
+        // GameWrapperManager.saveTicketProgress() as callRgsMethod("setTicketData",
+        // [progress]) -- a single positional arg -- so on the wire this
+        // regularly arrives as SetTicketData(undefined, progressJson). Fall
+        // back to the current unsettled ticket so progress still saves.
+        const id = ticketId || this.unsettledTicketId;
+        const record = id ? this.tickets.get(id) : null;
+        if (!record) return null; // best-effort -- caller already swallows errors
+        record.progress = data;
+        this._saveState();
+        return true;
+    }
+
+    // -------------------------------------------------------
+    // Offline network guard
+    // -------------------------------------------------------
+    _installOfflineGuard() {
+        if (this._guardInstalled) return;
+        const self = this;
+
+        const allowedOrigins = new Set([window.location.origin, ...(this.manager?.allowedOrigins || [])]);
+
+        const isRefusedUrl = (url) => {
+            try {
+                if (typeof url !== "string") return false;
+                if (url.startsWith("data:") || url.startsWith("blob:")) return false;
+                const parsed = new URL(url, window.location.href);
+                if (allowedOrigins.has(parsed.origin)) return false;
+                if (self.allowedExtraHosts.has(parsed.host)) return false;
+                return true;
+            } catch (_err) {
+                return false; // unparseable -- let it through rather than break something benign
+            }
+        };
+
+        const recordRefusal = (kind, url) => {
+            self.networkRefusals.push({ kind, url, at: new Date().toISOString() });
+            console.warn(`[LocalRgs] Offline guard refused ${kind} request to`, url);
+        };
+
+        // fetch()
+        this._origFetch = window.fetch?.bind(window);
+        if (this._origFetch) {
+            window.fetch = function (input, init) {
+                const url = typeof input === "string" ? input : input?.url;
+                if (isRefusedUrl(url)) {
+                    recordRefusal("fetch", url);
+                    return Promise.reject(new TypeError("LocalRgs offline guard: network access refused"));
+                }
+                return self._origFetch(input, init);
+            };
+        }
+
+        // XMLHttpRequest.open() -- flag refused requests; the patched send()
+        // above already intercepts RGS-shaped bodies before this matters for
+        // real RGS traffic, so this only catches genuinely other XHR use.
+        const XHR = window.XMLHttpRequest;
+        this._origXhrOpen = XHR.prototype.open;
+        XHR.prototype.open = function (method, url, ...rest) {
+            this.__localRgsRefused = isRefusedUrl(url);
+            this.__localRgsUrl = url;
+            return self._origXhrOpen.call(this, method, url, ...rest);
+        };
+        const origSendForGuard = XHR.prototype.send;
+        XHR.prototype.send = function (body) {
+            if (this.__localRgsRefused) {
+                recordRefusal("xhr", this.__localRgsUrl);
+                self._failXhrOffline(this);
+                return;
+            }
+            return origSendForGuard.call(this, body);
+        };
+
+        // WebSocket
+        this._origWebSocket = window.WebSocket;
+        if (this._origWebSocket) {
+            const OriginalWebSocket = this._origWebSocket;
+            function GuardedWebSocket(url, protocols) {
+                if (isRefusedUrl(url)) {
+                    recordRefusal("websocket", url);
+                    throw new DOMException("LocalRgs offline guard: network access refused", "SecurityError");
+                }
+                return protocols === undefined ? new OriginalWebSocket(url) : new OriginalWebSocket(url, protocols);
+            }
+            GuardedWebSocket.prototype = OriginalWebSocket.prototype;
+            GuardedWebSocket.CONNECTING = OriginalWebSocket.CONNECTING;
+            GuardedWebSocket.OPEN = OriginalWebSocket.OPEN;
+            GuardedWebSocket.CLOSING = OriginalWebSocket.CLOSING;
+            GuardedWebSocket.CLOSED = OriginalWebSocket.CLOSED;
+            window.WebSocket = GuardedWebSocket;
+        }
+
+        // navigator.sendBeacon
+        if (navigator.sendBeacon) {
+            this._origSendBeacon = navigator.sendBeacon.bind(navigator);
+            navigator.sendBeacon = function (url, data) {
+                if (isRefusedUrl(url)) {
+                    recordRefusal("sendBeacon", url);
+                    return false;
+                }
+                return self._origSendBeacon(url, data);
+            };
+        }
+
+        this._isRefusedUrl = isRefusedUrl;
+        this._guardInstalled = true;
+    }
+
+    _failXhrOffline(xhr) {
+        const define = (prop, value) => Object.defineProperty(xhr, prop, { value, configurable: true });
+        define("readyState", 4);
+        define("status", 0);
+        define("statusText", "");
+        define("responseText", "");
+        define("response", "");
+        if (typeof xhr.onreadystatechange === "function") xhr.onreadystatechange();
+        if (typeof xhr.onerror === "function") xhr.onerror(new ProgressEvent("error"));
+    }
+
+    // -------------------------------------------------------
+    // Console API
+    // -------------------------------------------------------
+    _buildConsoleApi() {
+        const self = this;
+        return {
+            help() {
+                console.log([
+                    "LocalRgs console API:",
+                    "  report()                  current balance / tickets settled / totals",
+                    "  levelSummary()             per-level probability, weight, win amount",
+                    "  verify()                   re-derive RTP/hit-rate/mystery-trigger and print them",
+                    "  soak(n = 100000)           deal n tickets in memory, compare empirical vs. theoretical",
+                    "  forceLevel(level)          next PurchaseTicket always lands on `level`",
+                    "  forceScenario(scenarioId)  next PurchaseTicket deals exactly this scenario row",
+                    "  clearForce()               clear forceLevel()/forceScenario()",
+                    "  setBalance(amount)         set the local wallet balance directly",
+                    "  reset()                    wipe all local state back to defaults",
+                    "  setLatency(ms)             simulate network latency on every RGS call",
+                    "  logRpc(on)                 toggle verbose per-call console logging",
+                    "  networkReport()            list every request the offline guard has refused",
+                    "  allowHost(host)            allow-list an extra host for the offline guard"
+                ].join("\n"));
+            },
+            report() {
+                const settled = Array.from(self.tickets.values()).filter(r => r.settled);
+                const totalWagered = Array.from(self.tickets.values()).reduce((s, r) => s + r.ticket.ticketPrice, 0);
+                const totalWon = settled.reduce((s, r) => s + r.ticket.winAmount, 0);
+                console.log({
+                    balance: self.balance,
+                    currency: self.currency,
+                    ticketsPurchased: self.tickets.size,
+                    ticketsSettled: settled.length,
+                    unsettledTicketId: self.unsettledTicketId,
+                    totalWagered,
+                    totalWon,
+                    empiricalRTP: totalWagered > 0 ? `${((totalWon / totalWagered) * 100).toFixed(4)}%` : "n/a"
+                });
+            },
+            levelSummary() {
+                const rows = self.levelOrder.map(level => {
+                    const weight = self.levelWeights.get(level) || 0n;
+                    const prize = self.prizeByLevel.get(level) || { winAmount: 0 };
+                    return {
+                        level,
+                        probability: `${(Number(weight * 1000000n / self.denomLcm) / 10000).toFixed(4)}%`,
+                        winAmount: prize.winAmount,
+                        scenarioRows: (self.scenariosByLevel.get(level) || []).length
+                    };
+                });
+                console.table(rows);
+            },
+            verify() {
+                let evNumerator = 0n; // sum(weight * winAmount), denom = self.denomLcm
+                let lossWeight = 0n;
+                let mysteryTriggerWeight = 0n; // levels 7-16 (Mystery Grab sub-prizes)
+                for (const level of self.levelOrder) {
+                    const weight = self.levelWeights.get(level) || 0n;
+                    const prize = self.prizeByLevel.get(level) || { winAmount: 0 };
+                    evNumerator += weight * BigInt(prize.winAmount);
+                    if (level === 0) lossWeight = weight;
+                    if (level >= 7) mysteryTriggerWeight += weight;
+                }
+                const ticketPrice = self.defaultBet || 6;
+                const rtpPct = Number(evNumerator * 1000000n / (self.denomLcm * BigInt(ticketPrice))) / 10000;
+                const hitRatePct = Number((self.denomLcm - lossWeight) * 1000000n / self.denomLcm) / 10000;
+                const mysteryTriggerPct = Number(mysteryTriggerWeight * 1000000n / self.denomLcm) / 10000;
+                console.log({
+                    rtp: `${rtpPct.toFixed(4)}%`,
+                    hitRate: `${hitRatePct.toFixed(4)}%`,
+                    mysteryTriggerRate: `${mysteryTriggerPct.toFixed(4)}% (unconditional)`,
+                    denomLcm: self.denomLcm.toString()
+                });
+            },
+            soak(n = 100000) {
+                const savedForcedLevel = self.forcedLevel;
+                const savedForcedScenario = self.forcedScenarioId;
+                self.forcedLevel = null;
+                self.forcedScenarioId = null;
+
+                let totalWin = 0;
+                let hits = 0;
+                let mysteryHits = 0;
+                for (let i = 0; i < n; i++) {
+                    const outcome = self._deal();
+                    totalWin += outcome.winAmount;
+                    if (outcome.level !== 0) hits++;
+                    if (outcome.level >= 7) mysteryHits++;
+                }
+
+                self.forcedLevel = savedForcedLevel;
+                self.forcedScenarioId = savedForcedScenario;
+
+                const ticketPrice = self.defaultBet || 6;
+                console.log({
+                    n,
+                    empiricalRTP: `${((totalWin / (n * ticketPrice)) * 100).toFixed(4)}%`,
+                    empiricalHitRate: `${((hits / n) * 100).toFixed(4)}%`,
+                    empiricalMysteryTriggerRate: `${((mysteryHits / n) * 100).toFixed(4)}%`
+                });
+            },
+            forceLevel(level) {
+                self.forcedLevel = level;
+                self.forcedScenarioId = null;
+                console.log(`[LocalRgs] Next PurchaseTicket forced to level ${level}.`);
+            },
+            forceScenario(scenarioId) {
+                self.forcedScenarioId = scenarioId;
+                self.forcedLevel = null;
+                console.log(`[LocalRgs] Next PurchaseTicket forced to scenarioID ${scenarioId}.`);
+            },
+            clearForce() {
+                self.forcedLevel = null;
+                self.forcedScenarioId = null;
+                console.log("[LocalRgs] Forced level/scenario cleared.");
+            },
+            setBalance(amount) {
+                self.balance = Number(amount) || 0;
+                self._saveState();
+                console.log(`[LocalRgs] Balance set to ${self.currency} ${self.balance.toFixed(2)}.`);
+            },
+            reset() {
+                try { window.localStorage?.removeItem(self._storageKey()); } catch (_err) { /* ignore */ }
+                self._loadState();
+                self.forcedLevel = null;
+                self.forcedScenarioId = null;
+                console.log("[LocalRgs] State reset to defaults.");
+            },
+            setLatency(ms) {
+                self.latencyMs = Math.max(0, Number(ms) || 0);
+                console.log(`[LocalRgs] Simulated latency set to ${self.latencyMs}ms.`);
+            },
+            logRpc(on = true) {
+                self.verboseLog = !!on;
+                console.log(`[LocalRgs] RPC logging ${self.verboseLog ? "enabled" : "disabled"}.`);
+            },
+            networkReport() {
+                console.table(self.networkRefusals);
+                return self.networkRefusals;
+            },
+            allowHost(host) {
+                self.allowedExtraHosts.add(host);
+                console.log(`[LocalRgs] Host allow-listed for the offline guard: ${host}`);
+            }
+        };
+    }
+}
+
+window.LocalRgs = LocalRgs;
+
 class MysteryGrabManager {
     constructor() {
         this.mysterGrabCelebrationAsset = {"in" : nc.graphicAssets.mystery_grab_in_000, "loop" : nc.graphicAssets.mystery_grab_lp_000, "out" : nc.graphicAssets.mystery_grab_out_000};
         this.mysteryGrab_Anim = pr.gameLayout.descendantsByName.MysteryGrab_Anim;
         this.mysterGrab_WinValue = pr.gameLayout.descendantsByName.MysteryGrab_WinValue;
-        this.WIN_DIGIT_SPACING = ProjectSettings.WIN_DIGIT_SPACING;
     }
 
     /**
@@ -4749,24 +5759,39 @@ class MysteryGrabManager {
         this.renderWinValue(this.currentWinAmount);
         if (pr.setBetController) pr.setBetController.addWinToBalance(this.currentWinAmount);
 
+        if (pr.audioController) pr.audioController.playSFX("19_mystery_reveal");
+
         this.mysteryGrab_Anim.configureSpriteSetter(this.mysterGrabCelebrationAsset["in"], 30);
         this.mysteryGrab_Anim.spriteSetter?.playOnce(this, "loopMysteryGrabCelebration");
         this.mysterGrab_WinValue.scale.swoop.all(1, 0.5);
     }
 
     /**
-     * Set the win amount on the MysteryGrab_WinValue TextBox.
+     * Spawn the win amount as digit sprites under MysteryGrab_WinValue, using
+     * the same asset lookup and centring as the main win display.
+     */
+    /**
+     * Set the win amount text.
      *
-     * MysteryGrab_WinValue is a TextBox component (renders its text via its
-     * own 'string' property) -- not a container to spawn digit sprites into
-     * like the main win display's totalWinDigit. Spawning GraphicObject
-     * children into it (the old approach) never rendered, so the
-     * celebration played with no value ever shown.
+     * MysteryGrab_WinValue is a native TextBox (renders to its own internal
+     * texture -- see Utilities/IncisorAPI.js's TextBox class, and its scene
+     * definition in Assets/GameLayout.construct, which already ships a
+     * "$000.00" placeholder string and a styled gold-gradient textFormat).
+     * It is not a plain sprite container like SetBetController's
+     * totalWinDigit, so the previous approach here -- manually parenting
+     * digit GraphicObjects under it, copied from displayTotalWin() -- never
+     * actually rendered through the TextBox correctly, which is why the
+     * Mystery Grab prize amount wasn't showing right. Setting `.string`
+     * directly is the correct, documented way to change a TextBox's text.
      */
     renderWinValue(winAmount) {
         const node = this.mysterGrab_WinValue;
         if (!node) return;
-        node.string = "$" + (Number(winAmount) || 0).toFixed(0);
+
+        const winString = pr.wrapperManager?.formatAmount
+            ? pr.wrapperManager.formatAmount(winAmount, true)
+            : "$" + (Number(winAmount) || 0).toFixed(0);
+        node.string = winString;
     }
 
     clearWinValue() {
@@ -4778,6 +5803,7 @@ class MysteryGrabManager {
     loopMysteryGrabCelebration() {
         this.mysteryGrab_Anim.configureSpriteSetter(this.mysterGrabCelebrationAsset["loop"], 30);
         this.mysteryGrab_Anim.spriteSetter?.play();
+        if (pr.audioController) pr.audioController.playSFX("22_mystery_winbanner");
         setTimeout(() => {
             this.mysteryGrab_Anim.spriteSetter.lazyStop = true;
             setTimeout(() => {
@@ -4958,8 +5984,33 @@ class PrizeController {
         prizeObj.rowID = 0;
         prizeObj.countID = 0;
         prizeObj.prizeType = "mystery_box";
-        prizeObj.winAssetRef = this.mysteryBoxWinAsset;
         this.mysteryBoxPrize = prizeObj;
+        // The scene's own default graphicAsset for this node is
+        // "sym_mystery_win" (the *opened* box) -- a design-time placeholder,
+        // not the idle look. Reset it to the closed box here and on every
+        // round (see SetBetController.resetVariables()) so a loss doesn't
+        // leave it permanently showing the win graphic, and resolve
+        // winAssetRef fresh (rather than a value captured once in the
+        // constructor, before graphic assets are necessarily loaded) so it
+        // matches how every other prize's "W" asset is resolved on demand
+        // in changePrizeGraphic() below.
+        this.resetMysteryBoxGraphic();
+    }
+
+    /**
+     * Reset the mystery box to its closed/idle look and re-resolve its win
+     * asset. Called on setup and at the start of every round.
+     */
+    resetMysteryBoxGraphic() {
+        const prizeObj = this.mysteryBoxPrize;
+        if (!prizeObj) return;
+        const idleAsset = nc.graphicAssets.sym_mystery || nc.assets.sym_mystery;
+        const winAsset = nc.graphicAssets.sym_mystery_win || nc.assets.sym_mystery_win;
+        if (idleAsset) {
+            if (prizeObj.setGraphicAsset) prizeObj.setGraphicAsset(idleAsset);
+            else prizeObj.texture = idleAsset;
+        }
+        if (winAsset) prizeObj.winAssetRef = winAsset;
     }
 
     changePrizeGraphic(prizeObj, state) {
@@ -5326,6 +6377,52 @@ class ProjectMain {
             // Dev/editor mode: set defaults and signal ready
             wm.updateBetDisplay(wm.currentBet);
             wm.state = "active";
+
+            // LocalRgs standalone (see ProjectCode/LocalRgs.js): no
+            // GameWrapper library at all, but still a real balance/ticket
+            // lifecycle -- run the same balance-fetch and unsettled-ticket
+            // recovery the full bootstrap does below (STEP 6/7), just
+            // against LocalRgs directly via callRgsMethod() rather than the
+            // real wrapper's rgs adapter.
+            if (wm.localRgs?.enabled) {
+                try {
+                    const account = await wm.callRgsMethod("getAccount");
+                    wm.updateBalanceDisplay(Number(account?.balance) || 0);
+                } catch (err) {
+                    console.warn("[GW] LocalRgs getAccount failed:", err);
+                }
+
+                try {
+                    const unsettled = await wm.callRgsMethod("getUnsettledTicket");
+                    if (unsettled && unsettled.ticketId) {
+                        console.log("[GW] LocalRgs: unsettled ticket found:", unsettled.ticketId);
+                        wm.currentTicket = unsettled;
+
+                        let savedProgress = null;
+                        try {
+                            savedProgress = await wm.loadTicketProgress(unsettled.ticketId);
+                        } catch (loadErr) {
+                            console.warn("[GW] loadTicketProgress failed (non-fatal):", loadErr);
+                        }
+
+                        if (savedProgress && pr.setBetController) {
+                            pr.setBetController.pendingResume = { ticket: unsettled, progress: savedProgress };
+                        } else {
+                            try {
+                                await wm._doSettleTicket();
+                                const refreshed = await wm.callRgsMethod("getAccount");
+                                wm.updateBalanceDisplay(Number(refreshed?.balance) || 0);
+                            } catch (settleErr) {
+                                wm.currentTicket = null;
+                                console.error("[GW] LocalRgs: settling stale unsettled ticket failed:", settleErr);
+                            }
+                        }
+                    }
+                } catch (err) {
+                    console.warn("[GW] LocalRgs getUnsettledTicket failed:", err);
+                }
+            }
+
             await wm.ensureMinimumLoadingScreenDuration();
             wm.gameReady();
             return;
@@ -5393,21 +6490,41 @@ class ProjectMain {
                 if (unsettled && unsettled.ticketId) {
                     console.log("[GW] Unsettled ticket found:", unsettled.ticketId);
                     wm.currentTicket = unsettled;
+
+                    // Prefer resuming the actual mid-round animation from
+                    // SetBetController._saveProgress()'s setTicketData()
+                    // checkpoint over settling straight to the final result --
+                    // NJ/Pennsylvania/Michigan/UK/Malta all ask for the former,
+                    // not just a bare settled result. GameIntro still owns the
+                    // Play-button flow at this point in bootstrap, so this only
+                    // stages the data for GameIntro.userPlayButtonPressed() to
+                    // pick up once the player taps Play; it does not resume here.
+                    let savedProgress = null;
                     try {
-                        await wm._doSettleTicket();
-                    } catch (settleErr) {
-                        // Settlement failed -- the ticket is still open.
-                        // Clear local state to avoid a stale reference, surface
-                        // the error through the wrapper UI, and halt bootstrap so
-                        // the player cannot start a new round on an unsettled ticket.
-                        wm.currentTicket = null;
-                        console.error("[GW] CRITICAL: _doSettleTicket() failed during bootstrap recovery. ticketId:",
-                            unsettled.ticketId, "error:", settleErr);
-                        wm.onError({ code: "unsettledticketexists", cause: settleErr });
-                        return; // Halt bootstrap -- do not call gameReady()
+                        savedProgress = await wm.loadTicketProgress(unsettled.ticketId);
+                    } catch (loadErr) {
+                        console.warn("[GW] loadTicketProgress failed (non-fatal):", loadErr);
                     }
-                    const refreshed = await wm.callRgsMethod("getAccount");
-                    wm.updateBalanceDisplay(Number(refreshed?.balance) || 0);
+
+                    if (savedProgress && pr.setBetController) {
+                        pr.setBetController.pendingResume = { ticket: unsettled, progress: savedProgress };
+                    } else {
+                        try {
+                            await wm._doSettleTicket();
+                        } catch (settleErr) {
+                            // Settlement failed -- the ticket is still open.
+                            // Clear local state to avoid a stale reference, surface
+                            // the error through the wrapper UI, and halt bootstrap so
+                            // the player cannot start a new round on an unsettled ticket.
+                            wm.currentTicket = null;
+                            console.error("[GW] CRITICAL: _doSettleTicket() failed during bootstrap recovery. ticketId:",
+                                unsettled.ticketId, "error:", settleErr);
+                            wm.onError({ code: "unsettledticketexists", cause: settleErr });
+                            return; // Halt bootstrap -- do not call gameReady()
+                        }
+                        const refreshed = await wm.callRgsMethod("getAccount");
+                        wm.updateBalanceDisplay(Number(refreshed?.balance) || 0);
+                    }
                 }
             } catch (err) {
                 console.warn("[GW] getUnsettledTicket failed:", err);
@@ -5441,6 +6558,18 @@ const ProjectSettings = {
 
     /** Total bet in credits. Also fixed; the player varies denomination instead. */
     TOTAL_BET_CREDITS: 6,
+
+    /**
+     * Jurisdiction codes (matched case-insensitively against the ?jurisdiction=
+     * URL param -- the same key libs/gamewrapper reads as params['jurisdiction'])
+     * for which a win <= TOTAL_BET_CREDITS gets no "You Won!" banner/SFX
+     * treatment (UK/Ontario rule -- see claude/clawfest-jurisdiction-tabs-status.md).
+     * The win AMOUNT itself always still displays via displayTotalWin();
+     * this only gates the extra celebratory banner + SFX. Empty/unrecognised
+     * jurisdiction (including NJ, the only one actually shipped today) does
+     * NOT gate -- every win celebrates unless explicitly configured to.
+     */
+    WIN_CELEBRATION_GATED_JURISDICTIONS: ["uk", "gb", "on", "ontario", "ca-on"],
 
     // -------------------------------------------------------
     // Layout / UI
@@ -5496,6 +6625,16 @@ const ProjectSettings = {
 
     /** Scale applied to a grabbed prize visual when it is parented to the claw */
     PRIZE_WIN_VISUAL_SCALE: 2.433,
+
+    // -------------------------------------------------------
+    // Mystery Grab miss feedback
+    // -------------------------------------------------------
+
+    /** Y offset (px) the mystery box bounces when the grab misses and it drops back into place */
+    MYSTERY_DROP_BOUNCE_OFFSET: 15,
+
+    /** Duration (seconds) for each leg of the mystery box's drop-bounce swoop */
+    MYSTERY_DROP_BOUNCE_DURATION_S: 0.2,
 
     // -------------------------------------------------------
     // Claw movement animation
@@ -5652,17 +6791,45 @@ const ProjectSettings = {
     WRAPPER_ACTIVE_TIMEOUT_MS: 120000,
 
     // -------------------------------------------------------
-    // GameWrapper (Fingenuity / Gromada) build toggle
-    //
-    // This build doesn't need the real wrapper -- flip back to false to
-    // bring it back for a real RGS-backed build. While true,
-    // GameWrapperManager.init() skips loading the wrapper library/config
-    // entirely (published or not) and the game runs purely on the local
-    // mock ticket -- see _getMockTicket() in GameWrapperManager.js.
+    // LocalRgs (see ProjectCode/LocalRgs.js and claude/clawfest-local-rgs.md)
     // -------------------------------------------------------
 
-    /** Skip all GameWrapper loading/instantiation and run mock-ticket-only */
-    GAME_WRAPPER_DISABLED: true,
+    /** Arm LocalRgs on every launch, with no URL param/localStorage flag needed. */
+    LOCAL_RGS_ENABLED_BY_DEFAULT: false,
+
+    /**
+     * When LocalRgs is active, also load and instantiate the real GameWrapper
+     * library (RGS calls served via transport intercept) instead of the
+     * default standalone mode (no wrapper library loaded at all, RGS calls
+     * served by direct calls into LocalRgs). Same effect as ?localrgs-wrapper=1.
+     */
+    LOCAL_RGS_LOAD_WRAPPER: false,
+
+    /** Block all non-allow-listed cross-origin network calls while LocalRgs is active. */
+    LOCAL_RGS_OFFLINE_GUARD: true,
+
+    /** Starting wallet balance (credits) for a fresh LocalRgs session. */
+    LOCAL_RGS_STARTING_BALANCE: 1000,
+
+    /**
+     * Candidate relative paths LocalRgs tries, in order, to load the game
+     * config JSON. Canonical source is libs/clawfest-6.json -- libs/ is the
+     * folder Incisor publishes flat into the build root alongside
+     * currency.json/wrapper-config.json/language-config.json/jurisdiction/,
+     * so "./clawfest-6.json" is what actually resolves both from the editor
+     * and from a published build; ProjectCode/ is never copied into a build
+     * at all, so a path under it here would never resolve outside the
+     * editor. (This was the concrete bug behind "the game wrapper is being
+     * used again" on 3 Sep 2026: clawfest-6.json used to live under
+     * ProjectCode/, so every published build's fetch() failed, LocalRgs
+     * silently gave up, and GameWrapperManager fell through to the real
+     * wrapper. See claude/clawfest-local-rgs.md.)
+     */
+    LOCAL_RGS_CONFIG_PATHS: [
+        "./clawfest-6.json",
+        "./libs/clawfest-6.json",
+        "./Publishing/Builds/clawfest-6.json"
+    ],
 };
 
 window.ProjectSettings = ProjectSettings;
@@ -5730,42 +6897,19 @@ class SetBetController {
             if (dBtn) {
                 dBtn.buttonActive = false; 
                 dBtn.isUsed = false; 
-                dBtn.addReleaseCallback(this, `onDirectionPressed${i}`);
+                // One shared handler for all 30 buttons -- addReleaseCallback's
+                // callbackArgs get appended after the (event, camera) params
+                // the engine always prepends, so the button index rides along
+                // instead of needing its own onDirectionPressedN() stub.
+                dBtn.addReleaseCallback(this, "onDirectionPressed", [i]);
                 this.dirButtons.push(dBtn);
             }
         }
     }
 
-    onDirectionPressed1() { this.handleDirectionSelection(1); }
-    onDirectionPressed2() { this.handleDirectionSelection(2); }
-    onDirectionPressed3() { this.handleDirectionSelection(3); }
-    onDirectionPressed4() { this.handleDirectionSelection(4); }
-    onDirectionPressed5() { this.handleDirectionSelection(5); }
-    onDirectionPressed6() { this.handleDirectionSelection(6); }
-    onDirectionPressed7() { this.handleDirectionSelection(7); }
-    onDirectionPressed8() { this.handleDirectionSelection(8); }
-    onDirectionPressed9() { this.handleDirectionSelection(9); }
-    onDirectionPressed10() { this.handleDirectionSelection(10); }
-    onDirectionPressed11() { this.handleDirectionSelection(11); }
-    onDirectionPressed12() { this.handleDirectionSelection(12); }
-    onDirectionPressed13() { this.handleDirectionSelection(13); }
-    onDirectionPressed14() { this.handleDirectionSelection(14); }
-    onDirectionPressed15() { this.handleDirectionSelection(15); }
-    onDirectionPressed16() { this.handleDirectionSelection(16); }
-    onDirectionPressed17() { this.handleDirectionSelection(17); }
-    onDirectionPressed18() { this.handleDirectionSelection(18); }
-    onDirectionPressed19() { this.handleDirectionSelection(19); }
-    onDirectionPressed20() { this.handleDirectionSelection(20); }
-    onDirectionPressed21() { this.handleDirectionSelection(21); }
-    onDirectionPressed22() { this.handleDirectionSelection(22); }
-    onDirectionPressed23() { this.handleDirectionSelection(23); }
-    onDirectionPressed24() { this.handleDirectionSelection(24); }
-    onDirectionPressed25() { this.handleDirectionSelection(25); }
-    onDirectionPressed26() { this.handleDirectionSelection(26); }
-    onDirectionPressed27() { this.handleDirectionSelection(27); }
-    onDirectionPressed28() { this.handleDirectionSelection(28); }
-    onDirectionPressed29() { this.handleDirectionSelection(29); }
-    onDirectionPressed30() { this.handleDirectionSelection(30); }
+    // One shared handler for all 30 direction buttons (see init() above)
+    // instead of 30 near-identical onDirectionPressedN() stubs.
+    onDirectionPressed(event, camera, btnIndex) { this.handleDirectionSelection(btnIndex); }
 
     /**
      * One round == one ticket. Both the total bet and the pick count are fixed
@@ -5806,6 +6950,7 @@ class SetBetController {
         this.currentScenarioPositions = null;
         this.currentScenarioStep = 0;
         this.currentTicketWinAmount = 0;
+        this.usedButtonIndices = [];
 
         try {
             const ticket = await pr.wrapperManager.purchaseTicket(currentBet);
@@ -5887,6 +7032,7 @@ class SetBetController {
         pr.audioController.playSFX("9_button_gameplay");
         this.isMoving = true; 
         btn.isUsed = true; 
+        (this.usedButtonIndices = this.usedButtonIndices || []).push(btnIndex);
 
         if (btn.colorMultiply && btn.colorMultiply.swoop) {
             btn.colorMultiply.swoop.red(2, 0.1);
@@ -5937,6 +7083,7 @@ class SetBetController {
             if (nc.flows.MainGameFlow.ClawMoving) nc.flows.MainGameFlow.ClawMoving.setToCurrentState();
             await this.processClawMovement(chosenDir);
         }
+        this._saveProgress();
         
         if (this.currentSelections > 0) {
             this.isMoving = false;
@@ -5950,6 +7097,142 @@ class SetBetController {
                 await this.mysteryGrabSequence();
             }
         }
+    }
+
+    /**
+     * Cheap client-vs-server-walk sanity check. The server is authoritative
+     * for the win regardless -- this only logs a warning if the client's
+     * own clamped walk (processClawMovement's switch above) ever disagrees
+     * with the position the ticket's scenario says that step landed on, so
+     * a client/server logic drift shows up in the console instead of silently
+     * animating the claw to the wrong cell. Uses scenarioPosToGridIndices(),
+     * which was otherwise dead code.
+     */
+    _assertWalkMatchesScenario() {
+        if (!this.currentScenarioPositions) return;
+        const stepIdx = this.currentScenarioStep - 1;
+        if (stepIdx < 0 || stepIdx >= this.currentScenarioPositions.length) return;
+        const [relX, relY] = this.currentScenarioPositions[stepIdx];
+        const [expectedX, expectedY] = pr.wrapperManager.scenarioPosToGridIndices(relX, relY);
+        if (expectedX !== this.currentXIndex || expectedY !== this.currentYIndex) {
+            console.warn(
+                "[CF] Client/server walk mismatch at step", stepIdx,
+                "-- client:", [this.currentXIndex, this.currentYIndex],
+                "server scenario:", [expectedX, expectedY]
+            );
+        }
+    }
+
+    /**
+     * Best-effort mid-round progress checkpoint, fired after every move
+     * resolves. Fire-and-forget -- GameWrapperManager.saveTicketProgress()
+     * swallows its own errors, so this never blocks or breaks gameplay.
+     */
+    _saveProgress() {
+        if (!pr.wrapperManager?.saveTicketProgress) return;
+        pr.wrapperManager.saveTicketProgress({
+            step: this.currentScenarioStep,
+            x: this.currentXIndex,
+            y: this.currentYIndex,
+            usedButtonIndices: this.usedButtonIndices || []
+        });
+    }
+
+    /**
+     * Resume an in-flight round after a reconnect, using the ticket's own
+     * scenario plus whatever _saveProgress() checkpoint survived the
+     * disconnect (read back via GameWrapperManager.loadTicketProgress()).
+     * There is no earlier visual state to recreate -- this skips the
+     * fresh-round intro animation entirely and jumps straight to the
+     * interactive mid-round state so remaining direction presses continue
+     * exactly like a normal round. Returns false (no state changed) if the
+     * ticket/progress can't be trusted, so the caller can fall back to
+     * settling immediately instead of stranding the player.
+     */
+    async resumeRoundFromTicket(ticket, savedProgress) {
+        const scenario = pr.wrapperManager.parseTicketScenario(ticket);
+        if (!scenario || !Array.isArray(scenario.s) || !scenario.s.length) return false;
+        if (!savedProgress || typeof savedProgress !== "object") return false;
+
+        this.currentScenarioMoves = scenario.s;
+        this.currentScenarioPositions = scenario.p || null;
+        this.currentTicketWinAmount = Number(ticket.winAmount) || 0;
+
+        const step = Math.max(0, Math.min(Number(savedProgress.step) || 0, this.currentScenarioMoves.length));
+        this.currentScenarioStep = step;
+        this.currentSelections = ProjectSettings.PICKS_PER_ROUND - step;
+
+        this.currentXIndex = Number.isFinite(savedProgress.x)
+            ? Math.max(0, Math.min(6, savedProgress.x))
+            : ProjectSettings.CLAW_START_X_INDEX;
+        this.currentYIndex = Number.isFinite(savedProgress.y)
+            ? Math.max(0, Math.min(6, savedProgress.y))
+            : ProjectSettings.CLAW_START_Y_INDEX;
+
+        const usedButtonIndices = Array.isArray(savedProgress.usedButtonIndices) ? savedProgress.usedButtonIndices : [];
+        this.usedButtonIndices = usedButtonIndices.slice();
+
+        // Re-mark the already-pressed buttons as used (and restore the
+        // direction glyph each one revealed) so the remaining, still-live
+        // buttons are exactly the ones the player hadn't pressed yet -- the
+        // same invariant MovesRevealed.js's ghost reveal depends on.
+        const assetsSource = nc.graphicAssets || nc.assets || {};
+        this.dirButtons.forEach((dBtn, i) => {
+            const btnIndex = i + 1;
+            const usedAt = usedButtonIndices.indexOf(btnIndex);
+            dBtn.isUsed = usedAt !== -1;
+            dBtn.buttonActive = !dBtn.isUsed && this.currentSelections > 0;
+            if (usedAt !== -1 && usedAt < this.currentScenarioMoves.length) {
+                const dir = pr.wrapperManager.mapScenarioDirection(this.currentScenarioMoves[usedAt]);
+                const asset = assetsSource[`button_${dir}`];
+                if (asset) {
+                    if (dBtn.setGraphicAsset) dBtn.setGraphicAsset(asset);
+                    else dBtn.texture = asset;
+                }
+            }
+        });
+
+        if (pr.prizeController && pr.prizeController.prizes) {
+            pr.prizeController.prizes.forEach(row => {
+                row?.forEach(prize => {
+                    if (prize) {
+                        prize.visible = true;
+                        pr.prizeController.changePrizeGraphic(prize, "H");
+                    }
+                });
+            });
+        }
+
+        if (this.prizeMap) {
+            this.prizeMap.enable();
+            if (this.prizeMap.scale.swoop) this.prizeMap.scale.swoop.all(1, 0);
+            else this.prizeMap.scale.x = this.prizeMap.scale.y = 1;
+        }
+        if (pr.prizeMapController) {
+            pr.prizeMapController.fadeDirectionPanel(false, 0);
+            pr.prizeMapController.updateMapUI(null, this.currentXIndex, this.currentYIndex);
+        }
+
+        if (this.claw) {
+            this.claw.visible = true;
+            this.claw.position.x = this.xPositions[this.currentXIndex];
+            if (this.claw.scale) this.claw.scale.x = this.claw.scale.y = this.yScales[this.currentYIndex];
+            const clawNum = this.currentSelections > 2 ? 2 : 1;
+            this.playSpineAnim(`claw_${clawNum}/claw_${clawNum}_idle`, true);
+        }
+
+        if (this.clawDigitPlaceholder) this.clawDigitPlaceholder.colorMultiply.alpha = 1;
+        this.updateClawMoves(this.currentSelections);
+
+        this.isMoving = false;
+
+        if (this.currentSelections > 0) {
+            if (pr.systemMessageController) pr.systemMessageController.showMessage(2);
+            nc.flows.MainGameFlow.StartGame.setToCurrentState();
+        } else if (pr.prizeController && !pr.prizeController.isWinningState) {
+            await this.mysteryGrabSequence();
+        }
+        return true;
     }
 
     /**
@@ -5970,6 +7253,7 @@ class SetBetController {
         this.currentScenarioPositions = null;
         this.currentScenarioStep = 0;
         this.currentTicketWinAmount = 0;
+        this.usedButtonIndices = [];
         
         this.setMetaButtonActive(false);
 
@@ -5995,6 +7279,10 @@ class SetBetController {
                 pr.prizeController.mysteryBoxPrize.visible = true;
                 pr.prizeController.mysteryBoxPrize.layerName = pr.prizeController.mysteryBoxPrize.originalLayer;
                 pr.prizeController.mysteryBoxPrize.subLayer = pr.prizeController.mysteryBoxPrize.originalSubLayer;
+                // Undo a previous round's win-visual swap and the scene's own
+                // wrong default (see PrizeController.resetMysteryBoxGraphic())
+                // so the box shows the closed look at the start of every round.
+                if (pr.prizeController.resetMysteryBoxGraphic) pr.prizeController.resetMysteryBoxGraphic();
             }
         }
 
@@ -6090,6 +7378,7 @@ class SetBetController {
             case "forward": this.currentYIndex = Math.min(6, this.currentYIndex + 1); break;
             case "backward": this.currentYIndex = Math.max(0, this.currentYIndex - 1); break;
         }
+        this._assertWalkMatchesScenario();
         if (pr.prizeMapController) pr.prizeMapController.updateMapUI(dir, this.currentXIndex, this.currentYIndex);
         
         const currentTargetPrize = pr.prizeController.getCurrentTargetPrize(this.currentXIndex, this.currentYIndex);
@@ -6222,7 +7511,9 @@ class SetBetController {
      */
     displayTotalWin(winAmount) {
         let totalWinAmount = Number(winAmount) || 0;
-        const winString = "$" + totalWinAmount.toFixed(0);
+        const winString = pr.wrapperManager?.formatAmount
+            ? pr.wrapperManager.formatAmount(totalWinAmount, true)
+            : "$" + totalWinAmount.toFixed(0);
         const totalWinDigit = pr.gameLayout.descendantsByName.totalWinDigit;
         
         if (!totalWinDigit) {
@@ -6395,6 +7686,13 @@ class SetBetController {
             return;
         }
 
+        // The server decides whether the Mystery Grab triggered. A ticket that
+        // lands on START carries either winAmount 0 (the 12.5% roll missed) or
+        // the 5x-14x prize in credits. The client only reflects that outcome --
+        // it never rolls for the feature itself -- so the result is already
+        // known before the claw animation starts.
+        const mysteryWin = this.currentTicketWinAmount > 0;
+
         const prizePosNode = this.claw.descendantsByName.PrizePos;
         const dropDuration = ProjectSettings.CLAW_DROP_DURATION;
         const returnDuration = ProjectSettings.CLAW_RETURN_DURATION;
@@ -6413,7 +7711,17 @@ class SetBetController {
             highlightPanel.colorMultiply.alpha = pc.highlightAlpha;
         }
         pr.audioController.playSFX("12_prize_highlight");
-        await this.wait(500);
+        await this.wait(1000);
+
+        // Revert the highlight (like a non-winning move reveal)
+        mysteryPrize.layerName = mysteryPrize.originalLayer;
+        mysteryPrize.subLayer = mysteryPrize.originalSubLayer;
+        if (highlightPanel?.colorMultiply?.swoop) {
+            highlightPanel.colorMultiply.swoop.alpha(0, 0.3);
+        } else if (highlightPanel?.colorMultiply) {
+            highlightPanel.colorMultiply.alpha = 0;
+        }
+        await this.wait(300);
 
         pr.audioController.playSFX("14_claw_closes");
         this.playSpineAnim("claw_1/claw_1_pick_in");
@@ -6434,23 +7742,32 @@ class SetBetController {
         this.playSpineAnim("claw_1/claw_1_catch_in");
         await this.wait(ProjectSettings.CLAW_CATCH_IN_MS);
 
-        if (prizePosNode && mysteryPrize.winAssetRef) {
-            let winVisual = new GraphicObject(mysteryPrize.winAssetRef, prizePosNode, "MysteryBox_Visual");
-            winVisual.scale.x = winVisual.scale.y = ProjectSettings.PRIZE_WIN_VISUAL_SCALE;
-            winVisual.position.x = 0;
-            winVisual.position.y = 0;
+        if (mysteryWin) {
+            if (prizePosNode && mysteryPrize.winAssetRef) {
+                let winVisual = new GraphicObject(mysteryPrize.winAssetRef, prizePosNode, "MysteryBox_Visual");
+                winVisual.scale.x = winVisual.scale.y = ProjectSettings.PRIZE_WIN_VISUAL_SCALE;
+                winVisual.position.x = 0;
+                winVisual.position.y = 0;
+            }
+            mysteryPrize.visible = false;
+        } else {
+            // The claw fails to secure the box -- bounce it back down to its
+            // resting spot instead of carrying it away.
+            pr.audioController.playSFX("21_mystery_drop");
+            await this.dropMysteryBoxBounce(mysteryPrize);
         }
-
-        mysteryPrize.visible = false;
         await this.wait(ProjectSettings.CLAW_POST_CATCH_MS);
 
-        pr.audioController.playSFX("16_get_prize");
+        if (mysteryWin) {
+            pr.audioController.playSFX("16_get_prize");
+            pr.audioController.playSFX("20_mystery_anticipation");
+        }
 
         if (this.claw.position.swoop) {
             this.claw.position.swoop.y(returnY, returnDuration);
         }
         await this.wait(returnDuration * 1000);
-        this.playSpineAnim("claw_1/claw_1_catch_lp", true);
+        this.playSpineAnim(mysteryWin ? "claw_1/claw_1_catch_lp" : "claw_1/claw_1_lp", true);
 
         if (this.claw.position.swoop) {
             this.claw.position.swoop.x(0, ProjectSettings.CLAW_CENTRE_RETURN_SWOOP_S);
@@ -6460,20 +7777,40 @@ class SetBetController {
             await this.wait(ProjectSettings.CLAW_CENTRE_RETURN_WAIT_MS);
         }
 
-        // The server decides whether the Mystery Grab triggered. A ticket that
-        // lands on START carries either winAmount 0 (the 12.5% roll missed) or
-        // the 5x-14x prize in credits. The client only reflects that outcome --
-        // it never rolls for the feature itself.
-        const mysteryWin = this.currentTicketWinAmount;
-
-        if (mysteryWin > 0 && pr.mysteryGrabManager) {
-            pr.mysteryGrabManager.startMysteryGrabCelebration(mysteryWin);
+        if (mysteryWin && pr.mysteryGrabManager) {
+            pr.mysteryGrabManager.startMysteryGrabCelebration(this.currentTicketWinAmount);
         } else {
             pr.wrapperManager.settleTicket()
                 .then(() => pr.wrapperManager.syncBalance())
                 .catch(err => console.warn("[CF] settleTicket (no win) error:", err));
             if (nc.flows.MainGameFlow.MovesRevealed) nc.flows.MainGameFlow.MovesRevealed.setToCurrentState();
         }
+    }
+
+    /**
+     * Bounce the mystery box down and back to its resting position, used when
+     * the Mystery Grab claw fails to secure it.
+     */
+    async dropMysteryBoxBounce(mysteryPrize) {
+        const offset = ProjectSettings.MYSTERY_DROP_BOUNCE_OFFSET;
+        const duration = ProjectSettings.MYSTERY_DROP_BOUNCE_DURATION_S;
+        const originalY = mysteryPrize.position.y;
+        const originalScaleX = mysteryPrize.scale.x;
+        const originalScaleY = mysteryPrize.scale.y;
+
+        if (mysteryPrize.position.swoop) mysteryPrize.position.swoop.y(originalY + offset, duration);
+        if (mysteryPrize.scale.swoop) mysteryPrize.scale.swoop.all(originalScaleX * 0.85, duration);
+        await this.wait(duration * 1000);
+
+        if (mysteryPrize.position.swoop) mysteryPrize.position.swoop.y(originalY, duration);
+        else mysteryPrize.position.y = originalY;
+
+        if (mysteryPrize.scale.swoop) mysteryPrize.scale.swoop.all(originalScaleX, duration);
+        else {
+            mysteryPrize.scale.x = originalScaleX;
+            mysteryPrize.scale.y = originalScaleY;
+        }
+        await this.wait(duration * 1000);
     }
 }
 class SystemMessageController {

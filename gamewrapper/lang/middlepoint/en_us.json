@@ -1,0 +1,5 @@
+{
+  "NOT_LOGGED_IN": "You are not currently logged in. Please log in and try again.",
+  "ACCOUNT_BLOCKED": "Your account is blocked. The game will now close. Please contact customer support.",
+  "TECHNICAL_ERROR": "A technical error has occurred. If it persists please contact customer support."
+}

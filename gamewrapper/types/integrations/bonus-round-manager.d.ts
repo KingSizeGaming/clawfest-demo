@@ -1,0 +1,51 @@
+import GameWrapper, { GameWrapperConfig } from '../GameWrapper';
+import { AnyObject, StringDictionary } from '../UtilTypes';
+import { BonusInfo } from './default-integration-types';
+import { RgsAdapter } from '../rgs/RgsAdapter';
+import { Rgs } from '../rgs/Rgs';
+import { StakeLimits } from '../rgs/RgsTypes';
+import { PluginHost } from '../CapabilityTypes';
+type BonusOfferFinishReason = 'bonusSpent' | 'bonusUnavailable';
+type BonusOfferTracking = {
+    id: string;
+    notified: boolean;
+    barVisible: boolean;
+};
+export declare class BonusRoundManager {
+    protected gameWrapper: GameWrapper;
+    protected config: GameWrapperConfig;
+    protected wrapperParams: StringDictionary;
+    protected unsettledTicketExists: boolean;
+    protected bonusInfo: BonusInfo;
+    protected bonusRoundsRgs: Rgs;
+    protected betLevel: number;
+    isUsingBonus: boolean;
+    protected bonusDeferred: boolean;
+    protected bonusOfferTracking: BonusOfferTracking | null;
+    protected availableLimits: StakeLimits;
+    protected currentTotalBetDivider: number;
+    protected allowedTotalBets: number[];
+    constructor(gameWrapper: GameWrapper, config: GameWrapperConfig, wrapperParams: StringDictionary);
+    setUnsettledTicketExists(ticketExists: boolean): void;
+    registerRequestPlugin(rgs: PluginHost): void;
+    protected handleNewRequest(host: any, data: AnyObject): Promise<void>;
+    protected addBonusHeader(xmlHttp: XMLHttpRequest): void;
+    protected resolveBonusRoundsAdapter(): RgsAdapter<Rgs>;
+    protected initializeRgsConfigParams(): Promise<void>;
+    protected findActiveBonus(bonuses: any): void;
+    protected getBonusOfferTracking(): BonusOfferTracking;
+    protected clearBonusBetRestrictions(): void;
+    protected computeBonusLimits(bonusRoundsAdapter: RgsAdapter<Rgs>): {
+        betLevel: number;
+        limits: StakeLimits;
+    } | null;
+    protected handleBonusRounds(): void;
+    protected activateBonus(): void;
+    protected startUsingBonus(): void;
+    protected declineBonusUsage(): void;
+    protected toggleBonusUsage: () => void;
+    protected updateBonusToggleButton(): void;
+    protected finishBonusOffer(reason: BonusOfferFinishReason): void;
+    setEventHandlers(): void;
+}
+export {};
