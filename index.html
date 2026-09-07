@@ -38,8 +38,8 @@ this.incisorVersion = '2026.03.09.10.46.24';
 this.incisorVersionSet = 'Red';
 this.projectName = 'Clawfest';
 this.publicProjectName = 'Clawfest';
-this.publishTimestamp="2026.09.03.17.38.35";
-this.habitatTimestamp="2026.09.03.17.38.36.0198";this.coreCanvasResolutionX=720;
+this.publishTimestamp="2026.09.07.13.38.36";
+this.habitatTimestamp="2026.09.07.13.38.36.0856";this.coreCanvasResolutionX=720;
 this.coreCanvasResolutionY=1280;
 this.canvasTransparency=false;
 this.mainCameraType="orthographic";
@@ -50,6 +50,13 @@ this.loadingTierDefinitions=[
 	{
 		"loadingTier":100,
 		"isAutoLoaded":true,
+		"incrementalContentProcessing":false,
+		"assetDataFileSizeLimitKB":800,
+		"performDuplicateRemoval":true
+	},
+	{
+		"loadingTier":200,
+		"isAutoLoaded":false,
 		"incrementalContentProcessing":false,
 		"assetDataFileSizeLimitKB":800,
 		"performDuplicateRemoval":true
@@ -87,6 +94,43 @@ function preloadConfiguration(projectConfiguration)
         projectConfiguration.preserveDrawingBuffer = false;
     ;
     projectConfiguration.canvasParent = document.body;
+
+    // ---------------------------------------------------------------
+    // Device-based asset package selection
+    //
+    // ProjectSettings.json's assetConfigurationDefinitions lists a lighter
+    // "50"/"mono_55" asset package alongside the full "100"/"stereo_115" set,
+    // and "supportedAssetConfigurations" now publishes both -- but nothing
+    // ever selected the lighter one at runtime, so every device, including
+    // constrained mobile ones, downloaded the full ~158MB payload. Switch
+    // constrained devices (mobile UA, or <=4GB reported device memory) to the
+    // lighter package. ?assetScale=/?soundQuality= URL params let QA force
+    // either path for testing regardless of the detected device.
+    //
+    // NOT yet verified against a real published build -- the "50" asset
+    // package has never actually been generated before (supportedAssetConfigurations
+    // only ever listed "100"). This needs a republish, then a real check that
+    // assetPackageScale:"50" actually loads correctly, before relying on it.
+    // ---------------------------------------------------------------
+    try {
+        var ua = (typeof navigator !== "undefined" && navigator.userAgent) || "";
+        var isMobileUA = /Android|iPhone|iPad|iPod|Mobile|Windows Phone/i.test(ua);
+        var lowMemory = (typeof navigator !== "undefined"
+            && typeof navigator.deviceMemory === "number"
+            && navigator.deviceMemory <= 4);
+        var isConstrained = isMobileUA || lowMemory;
+
+        var forcedScale = projectConfiguration.urlParams && projectConfiguration.urlParams.assetScale;
+        var forcedSound = projectConfiguration.urlParams && projectConfiguration.urlParams.soundQuality;
+
+        projectConfiguration.assetConfiguration.assetPackageScale = forcedScale || (isConstrained ? "50" : "100");
+        projectConfiguration.assetConfiguration.soundQuality = forcedSound || (isConstrained ? "mono_55" : "stereo_115");
+    } catch (e) {
+        console.warn("[PreloadConfiguration] device-scale detection failed, falling back to full asset package:", e);
+        projectConfiguration.assetConfiguration.assetPackageScale = "100";
+        projectConfiguration.assetConfiguration.soundQuality = "stereo_115";
+    }
+
 // define resource loading override function (this is optional)
     this.resourceLoadingOverride=function(filename)
     {
