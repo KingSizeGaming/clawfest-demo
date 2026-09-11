@@ -7875,7 +7875,10 @@ class SetBetController {
             this.prizeMapLion.disable();
             this.prizeMapViration = pr.prizeVariation === "Lion" ? this.prizeMapLion : this.prizeMapUnicorn;
             this.prizeMapViration.enable();
-            this.prizeMapViration.configureSpriteSetter(nc.graphicAssets.prize_map_unicorn_001, 30);
+            this.prizeMapVaritationGraphic = pr.prizeVariation === "Lion" ? nc.graphicAssets.prize_lion_001 : nc.graphicAssets.prize_map_unicorn_001;
+            if(!this.prizeMapViration.spriteSetter){
+                this.prizeMapViration.configureSpriteSetter(this.prizeMapVaritationGraphic, 30);
+            }
             this.prizeMapViration.spriteSetter.playOnce();
             pr.audioController.playSFX("3_pop_up_appearance");
             pr.audioController.playSFX("6_prizemap_anim");
@@ -7886,8 +7889,6 @@ class SetBetController {
         pr.audioController.stopIdleBGM();
         pr.audioController.playSFX("7_enter_gameplay");
         pr.audioController.playPlayBGM();
-
-        // if (this.prizeMap?.scale.swoop) this.prizeMap.scale.swoop.all(0, duration);
 
         await this.wait(this.prizeMapViration.spriteSetter.duration * 20); // Wait for the unicorn to finish its animation
         if (this.prizeMap) this.prizeMap.disable();
@@ -8154,8 +8155,6 @@ class SetBetController {
         // Ensure the prize map is fully hidden between rounds so it does not
         // appear to show twice when a new game starts.
         if (this.prizeMap) {
-            if (this.prizeMap.scale.swoop) this.prizeMap.scale.swoop.all(0, 0);
-            this.prizeMap.scale.x = this.prizeMap.scale.y = 0;
             this.prizeMap.disable();
         }
 
